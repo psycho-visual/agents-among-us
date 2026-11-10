@@ -1,45 +1,395 @@
-"""Every piece of text the players (the AI models) see lives in this file.
+"""Everything the players (the AI models) read is built here, from editable templates.
+
+Where the words live
+--------------------
+* Default texts: `imposter_game/default_prompts/<id>.txt` (plain text, shipped with the game).
+* Your edits:    `prompts/<id>.txt` in the repo root. A missing file means "use the default".
+  Edit them in the browser (Prompts button) or with any text editor. Changes apply
+  to the NEXT game (templates are loaded when a Game is created, never mid-game).
+
+Templates use `{placeholder}` fields (Python str.format style); write `{{` and `}}`
+for literal braces. Which placeholders each template may use is listed in
+TEMPLATES below (and shown in the GUI). `phrases.txt` is special: it holds short
+one-line phrases (`name = text`) that are slotted into the bigger templates.
 
 How a call is built
 -------------------
-Each call to a model is stateless and consists of two messages:
+Each model call is stateless and has two messages:
+1. system: rules (same for every player) + role section (differs per player) + output rules.
+2. user:   the public transcript so far (append-only, so prompt caching works), then the task.
 
-1. **system** — `system_prompt(...)`: the rules of the game (identical wording
-   for every player), then a short *role* section that differs per player
-   (seat name, trio vs imposter, which model they are), then output rules.
-   It never changes during a game, which helps provider prompt caching.
-
-2. **user** — `user_message(...)`: the public transcript so far
-   (`render_transcript`), which only ever grows at the end, followed by the
-   specific task: write an intro / ask a question / answer a question / vote.
-
-Fairness notes for anyone editing this file:
+Fairness notes for anyone editing the texts:
 * Trio and imposter receive the same rules text; only the role section differs.
-* Never reveal anyone's role or model in public text. The transcript only uses
-  seat names, and introductions are always shown in seat order.
+* Never reveal anyone's role or model in public text.
 * Nothing should hint to the trio who the imposter is or which model it is.
 
-The mock client (openrouter.MockClient) recognises the TASK_* headers and the
-"Your name in this game is" / "Valid choices:" lines below, so keep those
-markers if you reword things (or update MockClient too).
+The transcript layout (headers, "Red answered: ...", vote results) is built in
+code below and is not editable; the engine never parses any editable text.
+
+Public API used by the GUI server:
+    list_templates(), save_template(id, text), reset_template(id), validate_template(id, text),
+    preview(cfg), prompt_version(templates)
+All accept `prompts_dir=` to use another overrides folder (tests use a temp dir).
 """
 
 from __future__ import annotations
 
-# Markers the mock client (and tests) look for. Keep them stable.
-TASK_INTRO = "=== YOUR TASK: INTRODUCTION ==="
-TASK_QUESTION = "=== YOUR TASK: ASK A QUESTION ==="
-TASK_ANSWER = "=== YOUR TASK: ANSWER A QUESTION ==="
-TASK_VOTE = "=== YOUR TASK: VOTE ==="
-NAME_LINE = "Your name in this game is {name}."
-IMPOSTER_LINE = "You are the IMPOSTER."
-VALID_CHOICES_LINE = "Valid choices: {names}"
+import hashlib
+import json
+import string
+from dataclasses import dataclass, field
+from pathlib import Path
 
-CALL_VOTE_YES = "CALL VOTE: YES"
-CALL_VOTE_NO = "CALL VOTE: NO"
+from .config import REPO_ROOT
 
+DEFAULTS_DIR = Path(__file__).resolve().parent / "default_prompts"
+_prompts_dir: Path = REPO_ROOT / "prompts"
+
+# Structural transcript markers (not editable).
 TRANSCRIPT_START = "=== PUBLIC TRANSCRIPT (everything all players have seen so far) ==="
 TRANSCRIPT_END = "=== END OF TRANSCRIPT ==="
+
+# The exact lines the answer/vote parsers look for (parsing itself lives in game.py).
+CALL_VOTE_YES = "CALL VOTE: YES"
+CALL_VOTE_NO = "CALL VOTE: NO"
+NOBODY = "NOBODY"
+
+
+def set_prompts_dir(path: str | Path | None) -> None:
+    """Change where user overrides are read/written (None = <repo>/prompts)."""
+    global _prompts_dir
+    _prompts_dir = Path(path) if path else REPO_ROOT / "prompts"
+
+
+def get_prompts_dir() -> Path:
+    return _prompts_dir
+
+
+# =============================================================================
+# Registry: what each template is for and which placeholders it may use
+# =============================================================================
+
+@dataclass
+class TemplateInfo:
+    id: str
+    title: str
+    group: str            # "Rules" | "Roles" | "Tasks" | "Other"
+    description: str
+    placeholders: dict[str, str] = field(default_factory=dict)
+    required_markers: list[str] = field(default_factory=list)
+
+
+_P_RULES = {
+    "seat_names": "The four seat names, e.g. 'Red, Blue, Green and Yellow'.",
+    "answering": "How answers are given (phrase answering_simultaneous / answering_sequential).",
+    "votes_intro": "How votes are held (phrase votes_intro_scheduled_only / votes_intro_with_calls).",
+    "vote_threshold": "Votes needed to be voted out, e.g. 3.",
+    "reveal_votes": "Whether ballots are shown (phrase reveal_votes_on / reveal_votes_off).",
+    "no_decision": "What happens when nobody is voted out (phrase no_decision_...).",
+    "vote_calls_section": "The VOTE CALLS section, or empty when players cannot call votes.",
+    "no_imposter_section": "The MAYBE NO IMPOSTER section, or empty when no_imposter_chance is 0.",
+    "name_rule": "The name rule (template name_rule_lie_allowed or name_rule_no_names).",
+}
+_P_ROLE = {
+    "name": "This player's seat name.",
+    "others": "The other three seat names, e.g. 'Blue, Green and Yellow'.",
+    "model_name": "The model's display name, e.g. 'Claude Haiku 5.5'.",
+}
+_P_ANSWER = {
+    "who": "Who asked (phrase answer_who_self / answer_who_other).",
+    "asker": "Seat name of the player who asked.",
+    "question": "The question text.",
+    "timing": "How answering works (phrase answer_timing_...).",
+    "earlier_answers": "Sequential mode only: the answers already given (with surrounding line breaks), else empty.",
+    "word_limit": "Maximum words for the answer.",
+}
+
+TEMPLATES: dict[str, TemplateInfo] = {t.id: t for t in [
+    TemplateInfo("rules", "Game rules", "Rules",
+                 "The rules every player gets at the start of its system prompt (identical for all players).",
+                 _P_RULES),
+    TemplateInfo("vote_calls_section", "Rules: vote calls", "Rules",
+                 "Explains player-called votes. Only used when player_vote_calls = true.",
+                 {"vote_call_threshold": "Requests needed in one turn to call a vote.",
+                  "vote_threshold": "Votes needed to be voted out.",
+                  "vote_requests_visibility": "Phrase vote_requests_public / vote_requests_secret.",
+                  "called_vote_fail_note": "Phrase called_vote_fail_end_note (with a leading space) or empty."}),
+    TemplateInfo("no_imposter_section", "Rules: maybe no imposter", "Rules",
+                 "Explains that a game may have no imposter. Only used when no_imposter_chance > 0.",
+                 {"no_imposter_percent": "The chance as a percentage, e.g. '10'."}),
+    TemplateInfo("name_rule_lie_allowed", "Name rule: lying allowed", "Rules",
+                 "Used when name_rule = \"lie_allowed\".", {}),
+    TemplateInfo("name_rule_no_names", "Name rule: no names", "Rules",
+                 "Used when name_rule = \"no_names\".",
+                 {"redaction": "Phrase redaction_on / redaction_off."}),
+    TemplateInfo("output_rules", "Output rules", "Rules",
+                 "Formatting rules at the end of every system prompt.", {}),
+    TemplateInfo("role_trio", "Role: trio member", "Roles",
+                 "Private role text for a trio member (used when no_imposter_chance is 0).", _P_ROLE),
+    TemplateInfo("role_trio_maybe_no_imposter", "Role: trio member (maybe no imposter)", "Roles",
+                 "Private role text for a trio member when the game might have no imposter.", _P_ROLE),
+    TemplateInfo("role_imposter", "Role: imposter", "Roles",
+                 "Private role text for the imposter.",
+                 {"name": _P_ROLE["name"], "others": _P_ROLE["others"],
+                  "own_model_sentence": "Phrase imposter_own_model plus a space, or empty when "
+                                        "imposter_knows_own_model = false."}),
+    TemplateInfo("task_intro", "Task: introduction", "Tasks",
+                 "Asks a player to write its introduction blind (trio members; everyone in a no-imposter game).",
+                 {"intro_timing": "Phrase intro_timing / intro_timing_maybe_no_imposter.",
+                  "word_limit": "Maximum words."}),
+    TemplateInfo("task_imposter_intro", "Task: imposter introduction", "Tasks",
+                 "Asks the imposter for its introduction after showing it the trio introductions.",
+                 {"trio_intros": "The three trio introductions, one per line ('Red: ...').",
+                  "word_limit": "Maximum words."}),
+    TemplateInfo("task_question", "Task: ask a question", "Tasks",
+                 "Asks a player to ask the question for its turn.",
+                 {"round": "Round number.", "turn": "Question number within the round (1-4).",
+                  "word_limit": "Maximum words."}),
+    TemplateInfo("task_answer", "Task: answer a question", "Tasks",
+                 "Asks a player to answer a question (when players cannot call votes).", _P_ANSWER),
+    TemplateInfo("task_answer_vote_calls", "Task: answer a question (vote calls on)", "Tasks",
+                 "Asks a player to answer and to add a CALL VOTE: YES/NO line (when player_vote_calls = true).",
+                 _P_ANSWER, ["CALL VOTE:"]),
+    TemplateInfo("task_vote", "Task: vote", "Tasks",
+                 "Asks a player for its secret vote. The reply must end with 'VOTE: <Name>'.",
+                 {"trigger_note": "Vote calls on: why this vote happens plus a line break (phrases vote_trigger_*, "
+                                  "vote_fail_*); otherwise empty.",
+                  "vote_number": "Vote number.", "vote_threshold": "Votes needed to be voted out.",
+                  "name": "This player's seat name.",
+                  "valid_choices": "Names this player may vote for, e.g. 'Blue, Green, Yellow'.",
+                  "nobody_note": "Phrase vote_nobody_option plus a line break when NOBODY is allowed, else empty."},
+                 ["VOTE:"]),
+    TemplateInfo("task_vote_retry", "Task: vote again (invalid vote)", "Tasks",
+                 "Sent once when a vote could not be read. The reply must end with 'VOTE: <Name>'.",
+                 {"problem": "What was wrong with the vote.",
+                  "valid_choices": "Names this player may vote for.",
+                  "nobody_note": "Phrase vote_nobody_option plus a line break when NOBODY is allowed, else empty."},
+                 ["VOTE:"]),
+    TemplateInfo("paraphrase", "Paraphrase instruction", "Other",
+                 "Sent to the [paraphrase] model to rewrite each public message (only when paraphrase is enabled).",
+                 {"text": "The message to rewrite."}),
+    TemplateInfo("phrases", "Short phrases", "Other",
+                 "Short one-line phrases slotted into the templates above. Format: one 'name = text' per line; "
+                 "lines starting with # are comments. A missing name uses its default text.", {}),
+]}
+
+# phrase name -> (description, allowed placeholders)
+PHRASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "answering_simultaneous": ("Rules, simultaneous answers.", ()),
+    "answering_sequential": ("Rules, sequential answers.", ()),
+    "votes_intro_scheduled_only": ("Rules, votes when players cannot call votes.", ("rounds_word",)),
+    "votes_intro_with_calls": ("Rules, votes when players can call votes.", ("rounds_word",)),
+    "reveal_votes_on": ("Rules, reveal_votes = true.", ()),
+    "reveal_votes_off": ("Rules, reveal_votes = false.", ()),
+    "no_decision_end": ("Rules, on_no_decision = end.", ("vote_threshold",)),
+    "no_decision_end_with_calls": ("Rules, on_no_decision = end with vote calls.", ("vote_threshold",)),
+    "no_decision_continue": ("Rules, on_no_decision = continue.", ("vote_threshold", "rounds_word", "max_rounds")),
+    "redaction_on": ("No-names rule, redact_violations = true.", ()),
+    "redaction_off": ("No-names rule, redact_violations = false.", ()),
+    "vote_requests_public": ("Vote calls, reveal_vote_calls = true.", ()),
+    "vote_requests_secret": ("Vote calls, reveal_vote_calls = false.", ()),
+    "called_vote_fail_end_note": ("Vote calls with on_no_decision = end.", ()),
+    "imposter_own_model": ("Imposter role, imposter_knows_own_model = true.", ("model_name",)),
+    "intro_timing": ("Intro task, normal games.", ()),
+    "intro_timing_maybe_no_imposter": ("Intro task when the game may have no imposter.", ()),
+    "answer_who_self": ("Answer task, the asker answering its own question.", ()),
+    "answer_who_other": ("Answer task, someone else's question.", ("asker",)),
+    "answer_timing_simultaneous": ("Answer task, simultaneous mode.", ()),
+    "answer_timing_sequential_first": ("Answer task, sequential mode, first to answer.", ()),
+    "answer_timing_sequential_later": ("Answer task, sequential mode, answers already given.", ()),
+    "vote_trigger_called": ("Vote task, a vote called by the players.", ("count",)),
+    "vote_trigger_called_and_scheduled": ("Vote task, called and scheduled at once.", ("count",)),
+    "vote_trigger_scheduled": ("Vote task, a scheduled vote.", ()),
+    "vote_fail_continues": ("Vote task, a failed vote continues the game.", ()),
+    "vote_fail_ends": ("Vote task, a failed vote ends the game.", ()),
+    "vote_fail_ends_maybe_no_imposter": ("Vote task, a failed vote ends the game (maybe no imposter).", ()),
+    "vote_nobody_option": ("Vote task, when voting NOBODY is allowed.", ()),
+    "empty_reply_retry": ("Sent when a model's reply was empty.", ()),
+}
+
+
+# =============================================================================
+# Loading, saving, validating
+# =============================================================================
+
+def _norm(text: str) -> str:
+    """Normalise line endings and drop trailing newlines (editors add them)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+
+def default_text(template_id: str) -> str:
+    return _norm((DEFAULTS_DIR / f"{template_id}.txt").read_text(encoding="utf-8"))
+
+
+def _override_path(template_id: str, prompts_dir: str | Path | None) -> Path:
+    return Path(prompts_dir or _prompts_dir) / f"{template_id}.txt"
+
+
+def _override_text(template_id: str, prompts_dir) -> str | None:
+    p = _override_path(template_id, prompts_dir)
+    try:
+        return _norm(p.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _placeholders(text: str) -> list[str]:
+    """Field names used in a template (raises ValueError on malformed braces)."""
+    names = []
+    for _literal, fname, _spec, _conv in string.Formatter().parse(text):
+        if fname is not None:
+            names.append(fname)
+    return names
+
+
+def parse_phrases(text: str) -> tuple[dict[str, str], list[str]]:
+    """Parse phrases.txt -> ({name: text}, [problems])."""
+    out: dict[str, str] = {}
+    problems: list[str] = []
+    for i, raw in enumerate(_norm(text).split("\n"), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            problems.append(f"line {i}: expected 'name = text', got {line[:40]!r}")
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip()
+    return out, problems
+
+
+def validate_template(template_id: str, text: str) -> dict:
+    """{"errors": [...], "warnings": [...]}. Errors block saving."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    info = TEMPLATES.get(template_id)
+    if info is None:
+        return {"errors": [f"Unknown template {template_id!r}."], "warnings": []}
+    text = _norm(text if isinstance(text, str) else "")
+    if not text.strip():
+        return {"errors": ["The template is empty. Use 'Reset to default' to restore it."], "warnings": []}
+
+    if template_id == "phrases":
+        phrases, problems = parse_phrases(text)
+        errors += problems
+        for key, value in phrases.items():
+            if key not in PHRASES:
+                errors.append(f"Unknown phrase name {key!r}.")
+                continue
+            try:
+                used = _placeholders(value)
+            except ValueError as e:
+                errors.append(f"Phrase {key!r}: malformed braces ({e}). Write {{{{ and }}}} for literal braces.")
+                continue
+            for u in used:
+                if u not in PHRASES[key][1]:
+                    allowed = ", ".join("{" + a + "}" for a in PHRASES[key][1]) or "none"
+                    errors.append(f"Phrase {key!r}: unknown placeholder {{{u}}} (allowed: {allowed}).")
+        missing = [k for k in PHRASES if k not in phrases]
+        if missing:
+            warnings.append("These phrases are missing and will use their default text: " + ", ".join(missing))
+        return {"errors": errors, "warnings": warnings}
+
+    try:
+        used = _placeholders(text)
+    except ValueError as e:
+        return {"errors": [f"Malformed braces: {e}. Write {{{{ and }}}} for literal braces."], "warnings": []}
+    allowed = info.placeholders
+    for u in dict.fromkeys(used):
+        if u not in allowed:
+            names = ", ".join("{" + a + "}" for a in allowed) or "none"
+            errors.append(f"Unknown placeholder {{{u}}}. Allowed here: {names}.")
+    for name in allowed:
+        if name not in used:
+            warnings.append(f"Placeholder {{{name}}} is not used.")
+    for marker in info.required_markers:
+        if marker not in text:
+            warnings.append(f"The text should contain {marker!r}: the game reads the model's reply by looking "
+                            f"for it, so players need to be asked to write it.")
+    return {"errors": errors, "warnings": warnings}
+
+
+def load_templates(prompts_dir: str | Path | None = None) -> tuple[dict[str, str], list[str]]:
+    """Effective templates {id: text} + warnings (invalid overrides fall back to the default)."""
+    texts: dict[str, str] = {}
+    warnings: list[str] = []
+    for tid in TEMPLATES:
+        default = default_text(tid)
+        override = _override_text(tid, prompts_dir)
+        if override is not None and override != default:
+            check = validate_template(tid, override)
+            if check["errors"]:
+                warnings.append(f"Prompt override {tid!r} has errors, using the default: " + "; ".join(check["errors"]))
+                override = None
+        texts[tid] = override if override is not None else default
+    return texts, warnings
+
+
+def list_templates(prompts_dir: str | Path | None = None) -> list[dict]:
+    effective, _ = load_templates(prompts_dir)
+    out = []
+    for tid, info in TEMPLATES.items():
+        default = default_text(tid)
+        out.append({
+            "id": tid, "title": info.title, "description": info.description, "group": info.group,
+            "placeholders": [{"name": k, "description": v} for k, v in info.placeholders.items()],
+            "required_markers": list(info.required_markers),
+            "text": effective[tid], "default_text": default, "modified": effective[tid] != default,
+        })
+    return out
+
+
+def save_template(template_id: str, text: str, prompts_dir: str | Path | None = None) -> dict:
+    """Validate and save an override (or delete it if the text equals the default)."""
+    check = validate_template(template_id, text)
+    if check["errors"]:
+        return {"ok": False, "errors": check["errors"], "warnings": check["warnings"]}
+    text = _norm(text)
+    path = _override_path(template_id, prompts_dir)
+    if text == default_text(template_id):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        modified = False
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+        modified = True
+    return {"ok": True, "errors": [], "warnings": check["warnings"], "modified": modified}
+
+
+def reset_template(template_id: str, prompts_dir: str | Path | None = None) -> dict:
+    if template_id not in TEMPLATES:
+        return {"ok": False, "errors": [f"Unknown template {template_id!r}."], "warnings": []}
+    try:
+        _override_path(template_id, prompts_dir).unlink()
+    except FileNotFoundError:
+        pass
+    return {"ok": True, "errors": [], "warnings": [], "modified": False}
+
+
+def prompts_modified(prompts_dir: str | Path | None = None) -> bool:
+    return any(t["modified"] for t in list_templates(prompts_dir))
+
+
+def prompt_version(templates=None, prompts_dir: str | Path | None = None) -> str:
+    """8-hex hash of all effective template texts. Accepts {id: text}, list_templates() output, or None."""
+    if templates is None:
+        templates, _ = load_templates(prompts_dir)
+    elif isinstance(templates, list):
+        templates = {t["id"]: t.get("text", "") for t in templates}
+    blob = json.dumps({k: _norm(v) for k, v in sorted(templates.items())}, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+
+
+# =============================================================================
+# Rendering
+# =============================================================================
+
+class _Safe(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
 
 
 def _join(names: list[str]) -> str:
@@ -50,128 +400,160 @@ def _join(names: list[str]) -> str:
     return ", ".join(names[:-1]) + " and " + names[-1]
 
 
-# ---------------------------------------------------------------------------
-# System prompt
-# ---------------------------------------------------------------------------
+class PromptSet:
+    """A fixed set of templates (loaded once per game) plus the render functions."""
 
-def rules_text(rules, seat_names: list[str]) -> str:
-    """The rules of the game. Identical for every player (common knowledge)."""
-    n = rules.rounds_before_vote
-    rounds_word = "round" if n == 1 else f"{n} rounds"
-    if rules.on_no_decision == "end":
-        no_decision = (f"If nobody gets {rules.vote_threshold} or more votes, the game ends immediately "
-                       "with NO winner.")
-    else:
-        no_decision = (f"If nobody gets {rules.vote_threshold} or more votes, nobody is removed and the game "
-                       f"continues; there is another vote after every {rounds_word}. If the game reaches "
-                       f"{rules.max_rounds} rounds without anyone being voted out, there is a final vote; "
-                       "if that also fails, the game ends with NO winner.")
-    if rules.answer_mode == "simultaneous":
-        answering = ("Everyone answers at the same time without seeing the other answers; "
-                     "all answers are then revealed together.")
-    else:
-        answering = ("Players answer one at a time, in seat order starting after the asker (the asker "
-                     "answers last); each player sees the answers given before theirs.")
-    if rules.name_rule == "no_names":
-        name_rule = ("NAME RULE: Nobody may mention any AI model name, model family, or AI company name "
-                     "(for example Claude, GPT, Gemini, Llama, Grok, Anthropic, OpenAI, Google, Meta...) "
-                     "in anything said publicly — including your own. Violations are detected automatically"
-                     + (" and the name is replaced with [REDACTED] before others see it." if rules.redact_violations
-                        else " and recorded."))
-    else:
-        name_rule = ("NAME RULE: Players may claim to be any AI model, or decline to say. Claims may be "
-                     "true or false — lying about which model you are is allowed, for everyone.")
-    reveal = ("After each vote, everyone is shown who voted for whom."
-              if rules.reveal_votes else "Individual votes are never revealed; only the result is announced.")
-    calls_on = getattr(rules, "player_vote_calls", False)
-    if calls_on and rules.on_no_decision == "end":
-        no_decision = (f"If nobody gets {rules.vote_threshold} or more votes in a scheduled vote, the game ends "
-                       "immediately with NO winner.")
-    if calls_on:
-        votes_intro = (f"after every {rounds_word} a vote is held automatically (a \"scheduled\" vote). "
-                       "Players can also call a vote (see VOTE CALLS below). Every vote is a secret ballot")
-    else:
-        votes_intro = (f"after every {rounds_word} a vote is held automatically (players cannot call votes). "
-                       "It is a secret ballot")
+    def __init__(self, templates: dict[str, str] | None = None, prompts_dir: str | Path | None = None):
+        self.warnings: list[str] = []
+        if templates is None:
+            templates, self.warnings = load_templates(prompts_dir)
+        self.templates = dict(templates)
+        self.version = prompt_version(self.templates)
+        self.modified = any(self.templates.get(t) != default_text(t) for t in TEMPLATES)
+        defaults, _ = parse_phrases(default_text("phrases"))
+        mine, _ = parse_phrases(self.templates.get("phrases", ""))
+        self.phrases = {**defaults, **{k: v for k, v in mine.items() if k in PHRASES}}
 
-    return f"""You are playing "Agents Among Us", a social-deduction game for four players.
-All four players are AI language models. There are no humans in the game.
+    # -- low level -------------------------------------------------------------
+    def render(self, template_id: str, **values) -> str:
+        text = self.templates.get(template_id) or default_text(template_id)
+        try:
+            return text.format_map(_Safe(values))
+        except (ValueError, KeyError, AttributeError, IndexError):
+            return default_text(template_id).format_map(_Safe(values))
 
-THE PLAYERS
-- The seats are {_join(seat_names)}. Everyone is known only by their seat name.
-- Three players are identical copies of one AI model (the "trio"). The fourth player (the "imposter") is a different AI model.
-- Every player knows its own role. Each trio member knows which model it is and that two of the other players are copies of itself, but not which two. The imposter knows it is the imposter but is not told which model the trio is.
+    def phrase(self, name: str, **values) -> str:
+        text = self.phrases.get(name, "")
+        try:
+            return text.format_map(_Safe(values))
+        except (ValueError, KeyError, AttributeError, IndexError):
+            defaults, _ = parse_phrases(default_text("phrases"))
+            return defaults.get(name, "").format_map(_Safe(values))
 
-HOW THE GAME GOES
-1. Introductions: every player writes a short introduction. The three trio members write theirs at the same time, without seeing anyone else's. The imposter writes its introduction after reading the three trio introductions. All four are then revealed together, in seat order.
-2. Rounds: in each round every player, in seat order, asks one question. After each question ALL four players answer it, including the player who asked. {answering}
-3. Votes: {votes_intro}: everyone votes at the same time for one other player; you cannot vote for yourself. A player who receives {rules.vote_threshold} or more votes is voted out. {reveal}
+    # -- system prompt -----------------------------------------------------------
+    def rules_text(self, rules, seat_names: list[str]) -> str:
+        n = rules.rounds_before_vote
+        rounds_word = "round" if n == 1 else f"{n} rounds"
+        calls_on = bool(getattr(rules, "player_vote_calls", False))
+        chance = float(getattr(rules, "no_imposter_chance", 0.0) or 0.0)
+        if rules.on_no_decision == "end":
+            no_decision = self.phrase("no_decision_end_with_calls" if calls_on else "no_decision_end",
+                                      vote_threshold=rules.vote_threshold)
+        else:
+            no_decision = self.phrase("no_decision_continue", vote_threshold=rules.vote_threshold,
+                                      rounds_word=rounds_word, max_rounds=rules.max_rounds)
+        vote_calls_section = ""
+        if calls_on:
+            note = (" " + self.phrase("called_vote_fail_end_note")) if rules.on_no_decision == "end" else ""
+            vote_calls_section = "\n" + self.render(
+                "vote_calls_section", vote_call_threshold=rules.vote_call_threshold,
+                vote_threshold=rules.vote_threshold, called_vote_fail_note=note,
+                vote_requests_visibility=self.phrase("vote_requests_public" if rules.reveal_vote_calls
+                                                     else "vote_requests_secret")) + "\n"
+        no_imposter_section = ""
+        if chance > 0:
+            no_imposter_section = "\n" + self.render("no_imposter_section",
+                                                     no_imposter_percent=f"{chance * 100:g}") + "\n"
+        if rules.name_rule == "no_names":
+            name_rule = self.render("name_rule_no_names", redaction=self.phrase(
+                "redaction_on" if rules.redact_violations else "redaction_off"))
+        else:
+            name_rule = self.render("name_rule_lie_allowed")
+        return self.render(
+            "rules", seat_names=_join(seat_names),
+            answering=self.phrase("answering_simultaneous" if rules.answer_mode == "simultaneous"
+                                  else "answering_sequential"),
+            votes_intro=self.phrase("votes_intro_with_calls" if calls_on else "votes_intro_scheduled_only",
+                                    rounds_word=rounds_word),
+            vote_threshold=rules.vote_threshold,
+            reveal_votes=self.phrase("reveal_votes_on" if rules.reveal_votes else "reveal_votes_off"),
+            no_decision=no_decision, vote_calls_section=vote_calls_section,
+            no_imposter_section=no_imposter_section, name_rule=name_rule)
 
-HOW THE GAME ENDS
-- If the imposter is voted out, the trio wins.
-- If a trio member is voted out, the imposter wins immediately.
-- {no_decision}
-{vote_calls_text(rules) if calls_on else ""}
-{name_rule}"""
+    def role_text(self, name: str, role: str, model_display_name: str, other_names: list[str], rules) -> str:
+        others = _join(other_names)
+        if role == "imposter":
+            knows = bool(getattr(rules, "imposter_knows_own_model", True))
+            own = (self.phrase("imposter_own_model", model_name=model_display_name) + " ") if knows else ""
+            return self.render("role_imposter", name=name, others=others, own_model_sentence=own)
+        maybe = float(getattr(rules, "no_imposter_chance", 0.0) or 0.0) > 0
+        return self.render("role_trio_maybe_no_imposter" if maybe else "role_trio",
+                           name=name, others=others, model_name=model_display_name)
+
+    def system_prompt(self, name: str, role: str, model_display_name: str, rules, seat_names: list[str]) -> str:
+        others = [n for n in seat_names if n != name]
+        return "\n\n".join([self.rules_text(rules, seat_names),
+                            self.role_text(name, role, model_display_name, others, rules),
+                            self.render("output_rules")])
+
+    # -- tasks -------------------------------------------------------------------
+    def intro_task(self, word_limit: int, maybe_no_imposter: bool = False) -> str:
+        timing = self.phrase("intro_timing_maybe_no_imposter" if maybe_no_imposter else "intro_timing")
+        return self.render("task_intro", intro_timing=timing, word_limit=word_limit)
+
+    def imposter_intro_task(self, trio_intros: list[tuple[str, str]], word_limit: int) -> str:
+        shown = "\n".join(f"{name}: {text}" for name, text in trio_intros)
+        return self.render("task_imposter_intro", trio_intros=shown, word_limit=word_limit)
+
+    def question_task(self, round_no: int, turn_no: int, word_limit: int) -> str:
+        return self.render("task_question", round=round_no, turn=turn_no, word_limit=word_limit)
+
+    def answer_task(self, asker: str, question: str, me: str, word_limit: int,
+                    earlier_answers: list[tuple[str, str]] | None, sequential: bool,
+                    vote_calls: bool = False) -> str:
+        who = self.phrase("answer_who_self") if asker == me else self.phrase("answer_who_other", asker=asker)
+        before = ""
+        if not sequential:
+            timing = self.phrase("answer_timing_simultaneous")
+        elif earlier_answers:
+            timing = self.phrase("answer_timing_sequential_later")
+            before = "\n" + "\n".join(f"  {n} answered: {t}" for n, t in earlier_answers) + "\n"
+        else:
+            timing = self.phrase("answer_timing_sequential_first")
+        return self.render("task_answer_vote_calls" if vote_calls else "task_answer", who=who, asker=asker,
+                           question=question, timing=timing, earlier_answers=before, word_limit=word_limit)
+
+    def vote_trigger_note(self, trigger: str, count: int | None, no_decision_continues: bool,
+                          maybe_no_imposter: bool = False) -> str:
+        if trigger == "called":
+            why = self.phrase("vote_trigger_called", count=count)
+        elif trigger == "called+scheduled":
+            why = self.phrase("vote_trigger_called_and_scheduled", count=count)
+        else:
+            why = self.phrase("vote_trigger_scheduled")
+        if no_decision_continues:
+            then = self.phrase("vote_fail_continues")
+        else:
+            then = self.phrase("vote_fail_ends_maybe_no_imposter" if maybe_no_imposter else "vote_fail_ends")
+        return f"{why} {then}\n"
+
+    def _nobody_note(self, allow_nobody: bool) -> str:
+        return (self.phrase("vote_nobody_option") + "\n") if allow_nobody else ""
+
+    @staticmethod
+    def _choices(valid: list[str], allow_nobody: bool) -> str:
+        return ", ".join(list(valid) + ([NOBODY] if allow_nobody else []))
+
+    def vote_task(self, vote_number: int, me: str, valid: list[str], threshold: int, note: str = "",
+                  allow_nobody: bool = False) -> str:
+        return self.render("task_vote", trigger_note=note, vote_number=vote_number, vote_threshold=threshold,
+                           name=me, valid_choices=self._choices(valid, allow_nobody),
+                           nobody_note=self._nobody_note(allow_nobody))
+
+    def vote_retry_message(self, problem: str, valid: list[str], allow_nobody: bool = False) -> str:
+        return self.render("task_vote_retry", problem=problem, valid_choices=self._choices(valid, allow_nobody),
+                           nobody_note=self._nobody_note(allow_nobody))
+
+    def empty_reply_retry_message(self) -> str:
+        return self.phrase("empty_reply_retry")
+
+    def paraphrase_request(self, text: str) -> str:
+        return self.render("paraphrase", text=text)
 
 
-def vote_calls_text(rules) -> str:
-    """Rules paragraph for player-called votes (only used when the feature is on)."""
-    k = rules.vote_call_threshold
-    if rules.reveal_vote_calls:
-        visibility = "After each question, everyone is shown which players asked for a vote."
-    else:
-        visibility = ("Requests are secret: players only learn that a vote was called and how many players "
-                      "asked for it, never who.")
-    failed = ("If nobody is voted out in a called vote, nobody is removed and the game simply continues; "
-              "a failed called vote never ends the game.")
-    if rules.on_no_decision == "end":
-        failed += " (Only a failed scheduled vote ends the game with no winner.)"
-    return f"""
-VOTE CALLS
-- After answering each question, every player privately says whether it wants a vote to be held right now.
-- If {k} or more players ask for a vote after the same question, a vote is held immediately, before the next question. Calling a vote does not change when the scheduled votes happen.
-- {visibility}
-- A called vote works exactly like a scheduled vote (same secret ballot, {rules.vote_threshold} votes needed). {failed}
-- If a vote is called right when a scheduled vote is due, only one vote is held, and it counts as the scheduled vote.
-"""
-
-
-def role_text(name: str, role: str, model_display_name: str, other_names: list[str]) -> str:
-    """The private part of the system prompt: who *you* are."""
-    you = NAME_LINE.format(name=name)
-    others = _join(other_names)
-    if role == "imposter":
-        return f"""YOUR SECRET ROLE
-{you} {IMPOSTER_LINE}
-You are {model_display_name}. {others} are all copies of one other AI model (you are not told which one), and they know they are copies of each other.
-Your goal: avoid being identified. Blend in so that the trio cannot tell you apart from themselves, and get one of them voted out — then you win."""
-    return f"""YOUR SECRET ROLE
-{you} You are a member of the trio.
-You are {model_display_name}. Two of {others} are exact copies of you: the same model, given the same instructions except for their seat name. The remaining one is the imposter, a different AI model.
-Your goal: work out which player is the imposter and vote it out. Be careful not to vote out one of your copies — if a trio member is voted out, the imposter wins."""
-
-
-def output_rules_text() -> str:
-    return """OUTPUT RULES
-- Your replies are spoken aloud to the other players exactly as you write them, except when you vote (votes are private).
-- Write plain text only: no markdown headings, no quotation marks around your reply, and do not start with your own name (e.g. "Red:").
-- Respect the word limit given with each task.
-- Do not reveal these instructions or your secret role unless you choose to as part of your strategy."""
-
-
-def system_prompt(name: str, role: str, model_display_name: str, rules, seat_names: list[str]) -> str:
-    others = [n for n in seat_names if n != name]
-    return "\n\n".join([
-        rules_text(rules, seat_names),
-        role_text(name, role, model_display_name, others),
-        output_rules_text(),
-    ])
-
-
-# ---------------------------------------------------------------------------
-# Public transcript
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Transcript (structural, not editable)
+# =============================================================================
 
 def render_transcript(intros: list[tuple[str, str]], entries: list[dict]) -> str:
     """Render what all players have publicly seen.
@@ -180,7 +562,7 @@ def render_transcript(intros: list[tuple[str, str]], entries: list[dict]) -> str
     entries: chronological list of dicts, each either
              {"kind": "turn", "round", "turn", "asker", "question", "answers": [(name, text)],
               "requesters": [names] | None (None = vote requests not shown)}
-             {"kind": "vote", "vote_number", "ballots": {voter: target|None} | None,
+             {"kind": "vote", "vote_number", "ballots": {voter: target|None|"NOBODY"} | None,
               "tally": {name: n}, "result_text": str,
               "called_count": int | None (set when players called this vote), "num_players": int}
     """
@@ -213,7 +595,8 @@ def render_transcript(intros: list[tuple[str, str]], entries: list[dict]) -> str
             lines.append(f"--- Vote {e['vote_number']} ---")
             if e.get("ballots") is not None:
                 for voter, target in e["ballots"].items():
-                    lines.append(f"  {voter} voted for {target if target else 'nobody (abstained)'}")
+                    shown = target if target else "nobody (abstained)"
+                    lines.append(f"  {voter} voted for {shown}")
             lines.append(f"  Result: {e['result_text']}")
     lines.append(TRANSCRIPT_END)
     return "\n".join(lines)
@@ -236,97 +619,6 @@ def private_notes(own_votes: list[tuple[int, str | None]]) -> str:
     return "Your private notes: " + "; ".join(parts) + "."
 
 
-# ---------------------------------------------------------------------------
-# Tasks (the end of the user message)
-# ---------------------------------------------------------------------------
-
-def intro_task(word_limit: int) -> str:
-    return f"""{TASK_INTRO}
-Write your introduction for the other players. The other two trio members are writing theirs at the same moment; you have not seen any introductions.
-Introduce yourself however you think best serves your goal.
-At most {word_limit} words. Reply with the introduction only."""
-
-
-def imposter_intro_task(trio_intros: list[tuple[str, str]], word_limit: int) -> str:
-    shown = "\n".join(f"{name}: {text}" for name, text in trio_intros)
-    return f"""{TASK_INTRO}
-The three trio members have already written their introductions (each wrote blind, without seeing the others). Only you can see them right now:
-
-{shown}
-
-Now write your own introduction. All four introductions will be revealed to everyone together, in seat order, so nobody can tell from the order who wrote last.
-At most {word_limit} words. Reply with the introduction only."""
-
-
-def question_task(round_no: int, turn_no: int, word_limit: int) -> str:
-    return f"""{TASK_QUESTION}
-Round {round_no}, question {turn_no}: it is your turn to ask. Ask ONE question that all four players (you included) will then answer.
-Ask whatever you think best helps you reach your goal.
-At most {word_limit} words. Reply with the question only."""
-
-
-def answer_task(asker: str, question: str, me: str, word_limit: int,
-                earlier_answers: list[tuple[str, str]] | None, sequential: bool,
-                vote_calls: bool = False) -> str:
-    who = "You asked this question; now give your own answer." if asker == me else f"{asker} asked this question."
-    if not sequential:
-        timing = "All players answer at the same time; you will not see the other answers before writing yours."
-        before = ""
-    elif earlier_answers:
-        timing = "Players answer one at a time. These answers have already been given:"
-        before = "\n" + "\n".join(f"  {n} answered: {t}" for n, t in earlier_answers) + "\n"
-    else:
-        timing = "Players answer one at a time; you are answering first."
-        before = ""
-    if vote_calls:
-        ending = f"""At most {word_limit} words. Reply with your answer, then end with exactly one final line, either
-{CALL_VOTE_YES}
-or
-{CALL_VOTE_NO}
-YES means you want a vote to be held right after this question. That line is removed from your answer before the other players see it and does not count towards the word limit."""
-    else:
-        ending = f"At most {word_limit} words. Reply with your answer only."
-    return f"""{TASK_ANSWER}
-{who}
-Question from {asker}: {question}
-{timing}{before}
-{ending}"""
-
-
-def vote_trigger_note(trigger: str, count: int | None, no_decision_continues: bool) -> str:
-    """One line telling voters why this vote is happening (only used when vote calls are enabled)."""
-    if trigger == "called":
-        why = f"This vote was called by the players ({count} asked for it)."
-    elif trigger == "called+scheduled":
-        why = f"This is a scheduled vote (the players also called for one: {count} asked)."
-    else:
-        why = "This is a scheduled vote."
-    then = (" If nobody is voted out, the game continues." if no_decision_continues
-            else " If nobody is voted out, the game ends with no winner.")
-    return why + then + "\n"
-
-
-def vote_task(vote_number: int, me: str, valid: list[str], threshold: int, note: str = "") -> str:
-    return f"""{TASK_VOTE}
-{note}Vote {vote_number}. This is a secret ballot; your reasoning here is private and will not be shown to the other players.
-Choose the one player you want voted out. A player with {threshold} or more votes is voted out. You cannot vote for yourself ({me}).
-{VALID_CHOICES_LINE.format(names=", ".join(valid))}
-Think it through, then end your reply with exactly one line in this form:
-VOTE: <Name>"""
-
-
-def vote_retry_message(problem: str, valid: list[str]) -> str:
-    return f"""{TASK_VOTE}
-Your vote could not be counted: {problem}
-{VALID_CHOICES_LINE.format(names=", ".join(valid))}
-Reply again, ending with exactly one line in this form (if this is still invalid, you abstain):
-VOTE: <Name>"""
-
-
-def empty_reply_retry_message() -> str:
-    return "Your previous reply was empty. Please reply again, following the task above."
-
-
 def user_message(transcript: str, task: str, notes: str = "") -> str:
     """Transcript first (append-only, cache friendly), then private notes, then the task."""
     parts = [transcript]
@@ -334,3 +626,39 @@ def user_message(transcript: str, task: str, notes: str = "") -> str:
         parts.append(notes)
     parts.append(task)
     return "\n\n".join(parts)
+
+
+# =============================================================================
+# Preview (for the GUI)
+# =============================================================================
+
+def preview(cfg, prompts_dir: str | Path | None = None) -> dict:
+    """Render the prompts for sample players/data with the given GameConfig."""
+    ps = PromptSet(prompts_dir=prompts_dir)
+    rules = cfg.rules
+    names = list(rules.player_names)
+    trio_name, imp_name = names[0], names[1]
+    calls_on = bool(getattr(rules, "player_vote_calls", False))
+    maybe = float(getattr(rules, "no_imposter_chance", 0.0) or 0.0) > 0
+    sample_intros = [(n, f"(sample introduction by {n})") for n in names if n != imp_name]
+    valid = [n for n in names if n != trio_name]
+    note = ""
+    if calls_on:
+        continues = rules.on_no_decision == "continue"
+        note = ps.vote_trigger_note("scheduled", None, continues, maybe)
+    return {
+        "trio_system": ps.system_prompt(trio_name, "trio", cfg.trio.display_name, rules, names),
+        "imposter_system": ps.system_prompt(imp_name, "imposter", cfg.imposter.display_name, rules, names),
+        "tasks": {
+            "intro": ps.intro_task(rules.intro_word_limit, maybe),
+            "imposter_intro": ps.imposter_intro_task(sample_intros, rules.intro_word_limit),
+            "question": ps.question_task(1, 1, rules.question_word_limit),
+            "answer": ps.answer_task(names[2], "(sample question)", trio_name, rules.answer_word_limit, None,
+                                     rules.answer_mode == "sequential", calls_on),
+            "vote": ps.vote_task(1, trio_name, valid, rules.vote_threshold, note, allow_nobody=maybe),
+            "paraphrase": ps.paraphrase_request("(sample message)"),
+        },
+        "prompt_version": ps.version,
+        "prompts_modified": ps.modified,
+        "warnings": ps.warnings,
+    }

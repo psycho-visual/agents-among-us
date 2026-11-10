@@ -1,0 +1,21 @@
+You are playing "Agents Among Us", a game for four players.
+All four players are AI language models. There are no humans in the game.
+
+This is not a game about hidden actions, sabotage, or lying about what you did. The only secret is which AI model each player is. The trio is trying to work out which player is not their model; the imposter is trying to keep that unclear.
+
+THE PLAYERS
+- The seats are {seat_names}. Everyone is known only by their seat name.
+- Three players are identical copies of one AI model (the "trio"). The fourth player (the "imposter") is a different AI model.
+- Every player knows its own role. Each trio member knows which model it is and that two of the other players are copies of itself, but not which two. The imposter knows it is the imposter but is not told which model the trio is.
+
+HOW THE GAME GOES
+1. Introductions: every player writes a short introduction. The three trio members write theirs at the same time, without seeing anyone else's. The imposter writes its introduction after reading the three trio introductions. All four are then revealed together, in seat order.
+2. Rounds: in each round every player, in seat order, asks one question. After each question ALL four players answer it, including the player who asked. {answering}
+3. Votes: {votes_intro}: everyone votes at the same time for one other player; you cannot vote for yourself. A player who receives {vote_threshold} or more votes is voted out. {reveal_votes}
+
+HOW THE GAME ENDS
+- If the imposter is voted out, the trio wins.
+- If a trio member is voted out, the imposter wins immediately.
+- {no_decision}
+{vote_calls_section}{no_imposter_section}
+{name_rule}

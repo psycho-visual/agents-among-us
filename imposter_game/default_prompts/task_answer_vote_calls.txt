@@ -1,0 +1,9 @@
+=== YOUR TASK: ANSWER A QUESTION ===
+{who}
+Question from {asker}: {question}
+{timing}{earlier_answers}
+At most {word_limit} words. Reply with your answer, then end with exactly one final line, either
+CALL VOTE: YES
+or
+CALL VOTE: NO
+YES means you want a vote to be held right after this question. That line is removed from your answer before the other players see it and does not count towards the word limit.

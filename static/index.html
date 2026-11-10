@@ -17,6 +17,8 @@
       <span id="mock-badge" class="badge badge-mock" hidden title="Fake models: no API calls, no cost">MOCK</span>
     </div>
     <nav class="controls" aria-label="Game controls">
+      <button id="btn-prompts" type="button" class="ghost" title="View and edit the prompts the players are given">Prompts ✎</button>
+      <span class="controls-sep" aria-hidden="true"></span>
       <button id="btn-new" type="button" title="Reload config.toml and set up a fresh game">New game</button>
       <button id="btn-next" type="button" class="primary" title="Play until the end of the next round (or vote)">Next round ▶</button>
       <button id="btn-all" type="button" title="Play until the game is over">Run whole game ⏩</button>
@@ -81,6 +83,33 @@
     </section>
   </main>
 
+  <div id="prompt-drawer" class="drawer" hidden>
+    <div class="drawer-backdrop" id="pd-backdrop"></div>
+    <section class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="pd-title">
+      <header class="drawer-head">
+        <h2 id="pd-title">Prompt templates</h2>
+        <div class="tabs" role="tablist">
+          <button type="button" role="tab" id="pd-tab-edit" class="tab active" aria-selected="true">Edit</button>
+          <button type="button" role="tab" id="pd-tab-preview" class="tab" aria-selected="false">Preview</button>
+        </div>
+        <span class="spacer"></span>
+        <span id="pd-version" class="small muted"></span>
+        <button type="button" id="pd-close" class="icon-btn" title="Close (Esc)" aria-label="Close">×</button>
+      </header>
+      <div class="drawer-note small">
+        ℹ️ Changes apply when you click <b>New game</b> — a game that is already running keeps its prompts.
+        Each game records its prompt version. Saved changes go to <code>prompts/&lt;name&gt;.txt</code>;
+        the built-in defaults are never changed.
+      </div>
+      <div id="pd-edit" class="pd-edit">
+        <nav id="pd-list" class="pd-list" aria-label="Templates"><p class="muted small">Loading…</p></nav>
+        <div id="pd-editor" class="pd-editor"></div>
+      </div>
+      <div id="pd-preview" class="pd-preview" hidden></div>
+    </section>
+  </div>
+
   <script src="/static/app.js"></script>
+  <script src="/static/prompts.js"></script>
 </body>
 </html>

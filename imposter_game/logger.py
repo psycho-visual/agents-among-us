@@ -87,11 +87,15 @@ def render_markdown(record: dict) -> str:
     out = [f"# Agents Among Us — game {record.get('game_id')}", ""]
     if record.get("mock"):
         out += ["*Mock game (fake models, no API calls).*", ""]
+    if record.get("has_imposter") is False:
+        out += ["**No imposter this game:** all four players are copies of the trio model.", ""]
     rules = record.get("config", {}).get("rules", {})
     out += [f"- Started: {record.get('started_at')}",
             f"- Rules: name rule `{rules.get('name_rule')}`, answers `{rules.get('answer_mode')}`, "
             f"vote every {rules.get('rounds_before_vote')} round(s), {rules.get('vote_threshold')} votes to remove, "
             f"no decision → `{rules.get('on_no_decision')}`",
+            f"- Prompt version: `{record.get('prompt_version', 'legacy')}`"
+            + (" (modified)" if record.get("prompts_modified") else ""),
             "", "| Seat | Name | Role | Model | Effort |", "|---|---|---|---|---|"]
     for p in players:
         out.append(f"| {p['seat']} | {p['name']} | {p['role']} | {p['display_name']} (`{p['model']}`) "
@@ -114,7 +118,8 @@ def render_markdown(record: dict) -> str:
                         ev.get("wants_vote")]
                 out += [who + flag + ":", "", _quote(ev.get("text")), ""]
             if ev.get("original_text") and ev.get("original_text") != ev.get("text"):
-                out += ["<details><summary>original (before cleanup/redaction)</summary>", "",
+                what = ", ".join(ev.get("transforms") or []) or "cleanup"
+                out += [f"<details><summary>original text (changed: {what})</summary>", "",
                         _quote(ev["original_text"]), "", "</details>", ""]
             if ev.get("reasoning"):
                 out += ["<details><summary>reasoning</summary>", "", _quote(ev["reasoning"]), "", "</details>", ""]
@@ -126,7 +131,7 @@ def render_markdown(record: dict) -> str:
             out += [f"*Vote requests after this question: {req} ({ev.get('count')} of {ev.get('threshold')} needed)"
                     + (" → **a vote is called**" if ev.get("triggered") else "") + "*", ""]
         elif t == "vote_cast":
-            target = ev.get("target") or "abstained"
+            target = ev.get("target") or ("NOBODY" if ev.get("abstain_reason") == "nobody" else "abstained")
             flag = "" if ev.get("valid") else " (invalid → abstain)"
             out += [f"**{ev['player']}** votes **{target}**{flag}", "", _quote(ev.get("reasoning") or ev.get("raw_text")), ""]
         elif t == "vote_result":

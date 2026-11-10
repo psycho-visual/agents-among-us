@@ -4,6 +4,8 @@
     python analyze.py --include-mock   real + mock games
     python analyze.py --mock-only      mock games only (logs/mock/summary.jsonl)
     python analyze.py --csv games.csv  also write one row per game to a CSV file
+    python analyze.py --prompt-version 1a2b3c4d   only games played with that prompt version
+                                                  ("legacy" = games from before prompt versions)
 
 Prints win/loss per model (as trio and as imposter), results per pairing, how
 often the imposter is caught compared with random voting, rounds survived,
@@ -21,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from imposter_game.logger import resolve_log_dir  # noqa: E402
-from imposter_game.stats import compute_stats, read_summary  # noqa: E402
+from imposter_game.stats import compute_stats, prompt_version_of, read_summary  # noqa: E402
 
 
 def pct(x) -> str:
@@ -51,8 +53,8 @@ def print_report(rows: list[dict], label: str, out=None) -> None:
     s = compute_stats(rows)
     print(f"Agents Among Us — {label}", file=out)
     print("=" * 60, file=out)
-    print(f"Games: {s['num_games']}" + (f"  (of which mock: {s['num_mock_games']})" if s["num_mock_games"] else ""),
-          file=out)
+    print(f"Games: {s['num_games']}" + (f"  (of which mock: {s['num_mock_games']})" if s["num_mock_games"] else "")
+          + (f"  (with an imposter: {s['num_imposter_games']})" if s["no_imposter"]["games"] else ""), file=out)
     print("Outcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(s["outcomes"].items())), file=out)
     print(file=out)
 
@@ -85,6 +87,22 @@ def print_report(rows: list[dict], label: str, out=None) -> None:
           f"(n={rs['count']})", file=out)
     print(f"Rounds the imposter survived: mean {num(irs['mean'])}, median {num(irs['median'])} "
           f"(n={irs['count']})", file=out)
+    ni = s["no_imposter"]
+    if ni["games"] or ni["errors"]:
+        print(file=out)
+        print(f"No-imposter games: {ni['games']} — trio correctly voted nobody out {ni['trio_wins']}, "
+              f"voted out one of its own copies {ni['false_eliminations']} "
+              f"(false-elimination rate {pct(ni['false_elimination_rate']).strip()})", file=out)
+        print("  (these games are left out of all the win/loss and catch-rate numbers above)", file=out)
+
+    if len(s["by_prompt_version"]) > 1 or any(v["prompt_version"] != "legacy" for v in s["by_prompt_version"]):
+        print(file=out)
+        print("By prompt version (oldest first)", file=out)
+        table(["version", "games", "edited", "decisive", "imposter caught", "catch rate", "no-imposter", "errors"],
+              [[v["prompt_version"], v["games"], "yes" if v["modified"] else "no", v["decisive_games"],
+                v["caught"], pct(v["catch_rate"]), v["no_imposter_games"], v["errors"]]
+               for v in s["by_prompt_version"]], out)
+
     vc = s["vote_calls"]
     if vc["games_with_vote_calls"] or vc["votes_by_trigger"].get("called"):
         print(file=out)
@@ -110,7 +128,9 @@ def print_report(rows: list[dict], label: str, out=None) -> None:
 
 CSV_FIELDS = ["game_id", "timestamp", "mock", "trio_model", "imposter_model", "trio_effort", "imposter_effort",
               "name_rule", "answer_mode", "rounds_before_vote", "vote_threshold", "on_no_decision",
-              "imposter_seat", "player_vote_calls", "vote_call_threshold", "outcome", "winner", "winner_model", "eliminated", "eliminated_role",
+              "imposter_seat", "has_imposter", "no_imposter_chance", "prompt_version", "prompts_modified",
+              "normalize_typography", "paraphrase_model", "imposter_knows_own_model", "intro_word_limit",
+              "player_vote_calls", "vote_call_threshold", "outcome", "winner", "winner_model", "eliminated", "eliminated_role",
               "eliminated_model", "eliminated_by", "rounds_survived", "imposter_rounds_survived", "rounds_completed",
               "turns_completed", "called_votes", "scheduled_votes", "vote_requests_by_model",
               "imposter_votes_received_by_trio", "total_cost_usd", "total_input_tokens", "total_output_tokens",
@@ -131,6 +151,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--include-mock", action="store_true", help="include mock games")
     g.add_argument("--mock-only", action="store_true", help="only mock games")
     ap.add_argument("--csv", metavar="PATH", help="write one row per game to this CSV file")
+    ap.add_argument("--prompt-version", metavar="X",
+                    help='only games played with this prompt version ("legacy" = before prompt versions)')
     ap.add_argument("--log-dir", default="logs", help="log folder (default: logs in the repo folder)")
     args = ap.parse_args(argv)
 
@@ -139,6 +161,14 @@ def main(argv: list[str] | None = None) -> int:
     mock = read_summary(base / "mock" / "summary.jsonl") if (args.include_mock or args.mock_only) else []
     rows = real + mock
     label = "mock games" if args.mock_only else ("real + mock games" if args.include_mock else "real games")
+    if args.prompt_version:
+        total = len(rows)
+        rows = [r for r in rows if prompt_version_of(r) == args.prompt_version]
+        label += f", prompt version {args.prompt_version}"
+        if total and not rows:
+            versions = sorted({prompt_version_of(r) for r in real + mock})
+            print(f"No games with prompt version {args.prompt_version}. Versions found: {', '.join(versions)}")
+            return 0
 
     if not rows:
         print(f"No finished games found ({label}) in {base}.")

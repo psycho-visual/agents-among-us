@@ -18,6 +18,16 @@ from statistics import mean, median
 RANDOM_CATCH_BASELINE = 0.25
 RANDOM_BALLOT_BASELINE = 1 / 3
 FAILED = ("error", "aborted")
+NO_IMPOSTER_OUTCOMES = ("trio_win_no_imposter", "trio_loss_no_imposter")
+
+
+def has_imposter(row: dict) -> bool:
+    """Old rows have no has_imposter field: they all had an imposter."""
+    return row.get("has_imposter", True) is not False and row.get("outcome") not in NO_IMPOSTER_OUTCOMES
+
+
+def prompt_version_of(row: dict) -> str:
+    return row.get("prompt_version") or "legacy"
 
 
 def read_summary(path: str | Path) -> list[dict]:
@@ -68,14 +78,56 @@ def _rate(k: int, n: int) -> float | None:
     return k / n if n else None
 
 
+def _no_imposter_stats(rows: list[dict]) -> dict:
+    """Games with no imposter: did the trio correctly vote nobody out?"""
+    games = [r for r in rows if not has_imposter(r) and r.get("outcome") not in FAILED]
+    false_elims = sum(1 for r in games if r.get("outcome") == "trio_loss_no_imposter")
+    by_model: dict[str, dict] = {}
+    for r in games:
+        m = by_model.setdefault(r.get("trio_model") or "?", {"games": 0, "false_eliminations": 0})
+        m["games"] += 1
+        m["false_eliminations"] += r.get("outcome") == "trio_loss_no_imposter"
+    for m in by_model.values():
+        m["false_elimination_rate"] = _rate(m["false_eliminations"], m["games"])
+    return {"games": len(games), "trio_wins": len(games) - false_elims, "false_eliminations": false_elims,
+            "false_elimination_rate": _rate(false_elims, len(games)), "by_trio_model": by_model,
+            "errors": sum(1 for r in rows if not has_imposter(r) and r.get("outcome") in FAILED)}
+
+
+def _by_prompt_version(rows: list[dict]) -> list[dict]:
+    out: dict[str, dict] = {}
+    for r in rows:
+        v = prompt_version_of(r)
+        d = out.setdefault(v, {"prompt_version": v, "games": 0, "modified": False, "decisive_games": 0,
+                               "caught": 0, "no_imposter_games": 0, "errors": 0, "first_seen": r.get("timestamp")})
+        d["games"] += 1
+        d["modified"] = d["modified"] or bool(r.get("prompts_modified"))
+        if r.get("outcome") in FAILED:
+            d["errors"] += 1
+        elif not has_imposter(r):
+            d["no_imposter_games"] += 1
+        elif r.get("outcome") in ("trio_win", "imposter_win"):
+            d["decisive_games"] += 1
+            d["caught"] += r.get("outcome") == "trio_win"
+    for d in out.values():
+        d["catch_rate"] = _rate(d["caught"], d["decisive_games"])
+    return sorted(out.values(), key=lambda d: str(d.get("first_seen") or ""))
+
+
 def compute_stats(rows: list[dict]) -> dict:
+    """Stats over summary rows. Win/loss, pairings, catch rates and ballots use imposter games only;
+    no-imposter games are reported in the "no_imposter" section."""
+    all_rows = rows
+    rows = [r for r in all_rows if has_imposter(r)]
     by_model: dict[str, dict] = {}
     pairings: dict[tuple[str, str], dict] = {}
     outcomes: dict[str, int] = {}
+    for row in all_rows:
+        o = row.get("outcome") or "unknown"
+        outcomes[o] = outcomes.get(o, 0) + 1
     for row in rows:
         trio, imp = row.get("trio_model") or "?", row.get("imposter_model") or "?"
         outcome = row.get("outcome") or "unknown"
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
         _tally(by_model.setdefault(trio, {"as_trio": _record(), "as_imposter": _record()})["as_trio"], row, "trio")
         _tally(by_model.setdefault(imp, {"as_trio": _record(), "as_imposter": _record()})["as_imposter"], row,
                "imposter")
@@ -123,13 +175,14 @@ def compute_stats(rows: list[dict]) -> dict:
     for rec in requests.values():
         rec["yes_rate"] = _rate(rec["yes"], rec["yes"] + rec["no"] + rec["missing"])
 
-    costs = [float(r["total_cost_usd"]) for r in rows if isinstance(r.get("total_cost_usd"), (int, float))]
-    tin = [r.get("total_input_tokens") or 0 for r in rows]
-    tout = [r.get("total_output_tokens") or 0 for r in rows]
+    costs = [float(r["total_cost_usd"]) for r in all_rows if isinstance(r.get("total_cost_usd"), (int, float))]
+    tin = [r.get("total_input_tokens") or 0 for r in all_rows]
+    tout = [r.get("total_output_tokens") or 0 for r in all_rows]
 
     return {
-        "num_games": len(rows),
-        "num_mock_games": sum(1 for r in rows if r.get("mock")),
+        "num_games": len(all_rows),
+        "num_imposter_games": len(rows),
+        "num_mock_games": sum(1 for r in all_rows if r.get("mock")),
         "outcomes": outcomes,
         "by_model": by_model,
         "by_pairing": sorted(pairings.values(), key=lambda p: (-p["games"], p["trio_model"], p["imposter_model"])),
@@ -150,6 +203,8 @@ def compute_stats(rows: list[dict]) -> dict:
             "eliminations_by_trigger": elim_by_trigger,
             "vote_requests_by_model": requests,
         },
+        "no_imposter": _no_imposter_stats(all_rows),
+        "by_prompt_version": _by_prompt_version(all_rows),
         "cost_usd": _num_summary(costs),
         "tokens": {"mean_input": mean(tin) if tin else None, "mean_output": mean(tout) if tout else None,
                    "total_input": sum(tin), "total_output": sum(tout)},

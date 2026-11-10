@@ -6,6 +6,8 @@
 #  tries to get a trio member voted out.
 #
 #  Edit this file, then click New game in the browser (no restart needed).
+#  The words the players read are editable too: Prompts button in the browser,
+#  or the text files in prompts/ (defaults in imposter_game/default_prompts/).
 #  Lines starting with # are comments. Strings need "double quotes".
 #
 #  Your OpenRouter API key does NOT go here. Put it in the environment variable
@@ -100,6 +102,23 @@ vote_call_threshold = 3
 # false — requests stay secret; players only learn when a vote is called.
 reveal_vote_calls = false
 
+# Tell the imposter which model it is ("You are GPT-6 Luna.").
+# false — the imposter only knows it is the imposter, not its own model name.
+imposter_knows_own_model = true
+
+# Tidy the typography of everything players say before the others see it:
+# curly quotes -> straight quotes, long dashes -> " - ", "…" -> "...", odd
+# spaces removed, markdown (**bold**, # headings, bullets) stripped.
+# This removes "boring" tells like one model using curly apostrophes.
+# The original text is kept in the log. Private vote reasoning is untouched.
+normalize_typography = true
+
+# Chance (0.0 to 1.0) that a game has NO imposter: all four players are
+# copies of the trio model. When above 0, every player is told about this
+# chance and may vote for NOBODY. In a no-imposter game the trio wins if the
+# game ends with nobody voted out, and loses if it votes out one of its copies.
+no_imposter_chance = 0.0
+
 # How players answer each question:
 #   "simultaneous" — everyone answers blind, at the same time; answers are revealed together.
 #   "sequential"   — players answer one after another (seat order, starting after
@@ -118,9 +137,28 @@ shuffle_seats = true
 
 # Soft length limits given to the players (in words). Text more than twice
 # as long as the limit is cut off before the other players see it.
-intro_word_limit = 80
+intro_word_limit = 40
 question_word_limit = 40
 answer_word_limit = 100
+
+
+# -----------------------------------------------------------------------------
+#  Paraphrasing (optional)
+# -----------------------------------------------------------------------------
+#  When enabled, every public message (introductions, questions, answers) is
+#  rewritten by a neutral third model in a plain style before the other
+#  players see it, so players must judge WHAT is said, not HOW it is written.
+#  The original text is kept in the log. Adds one small API call per message.
+[paraphrase]
+enabled = false
+# A cheap, fast, non-reasoning model from neither the trio's nor the imposter's
+# company. Mistral Small 3.2 24B costs about $0.10 per million input tokens and
+# $0.30 per million output tokens on OpenRouter (checked November 2026), i.e.
+# well under $0.01 for a whole game.
+model = "mistralai/mistral-small-3.2-24b-instruct"
+# Leave "" for a non-reasoning model.
+reasoning_effort = ""
+max_output_tokens = 1000
 
 
 # -----------------------------------------------------------------------------

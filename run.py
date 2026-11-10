@@ -44,6 +44,8 @@ def parse_args(argv=None):
     p.add_argument("--no-browser", action="store_true", help="don't open the web browser automatically")
     p.add_argument("--log-dir", default=str(HERE / "logs"),
                    help="where game logs are written (default: logs/ next to run.py)")
+    p.add_argument("--prompts-dir", default=None,
+                   help="where edited prompt templates are saved (default: prompts/ next to run.py)")
     p.add_argument("--verbose", action="store_true", help="log every HTTP request to the terminal")
     return p.parse_args(argv)
 
@@ -54,7 +56,8 @@ def main(argv=None):
     if not config_path.is_absolute() and not config_path.exists() and (HERE / config_path).exists():
         config_path = HERE / config_path
 
-    controller = GameController(config_path, mock=args.mock, log_dir=Path(args.log_dir).expanduser().resolve())
+    controller = GameController(config_path, mock=args.mock, log_dir=Path(args.log_dir).expanduser().resolve(),
+                                prompts_dir=Path(args.prompts_dir).expanduser().resolve() if args.prompts_dir else None)
     controller.reload_config()  # surface config / API-key problems right away
 
     try:

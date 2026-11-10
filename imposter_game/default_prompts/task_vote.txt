@@ -1,0 +1,6 @@
+=== YOUR TASK: VOTE ===
+{trigger_note}Vote {vote_number}. This is a secret ballot; your reasoning here is private and will not be shown to the other players.
+Choose the one player you want voted out. A player with {vote_threshold} or more votes is voted out. You cannot vote for yourself ({name}).
+Valid choices: {valid_choices}
+{nobody_note}Think it through, then end your reply with exactly one line in this form:
+VOTE: <Name>

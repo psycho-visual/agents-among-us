@@ -1,0 +1,6 @@
+VOTE CALLS
+- After answering each question, every player privately says whether it wants a vote to be held right now.
+- If {vote_call_threshold} or more players ask for a vote after the same question, a vote is held immediately, before the next question. Calling a vote does not change when the scheduled votes happen.
+- {vote_requests_visibility}
+- A called vote works exactly like a scheduled vote (same secret ballot, {vote_threshold} votes needed). If nobody is voted out in a called vote, nobody is removed and the game simply continues; a failed called vote never ends the game.{called_vote_fail_note}
+- If a vote is called right when a scheduled vote is due, only one vote is held, and it counts as the scheduled vote.

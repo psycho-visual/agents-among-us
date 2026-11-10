@@ -182,20 +182,20 @@ class ScriptedClient:
         self.lock = threading.Lock()
         self.log: list[tuple[str, str]] = []    # (player, task) in call order
 
-    def chat(self, model, messages, reasoning_effort, max_tokens, session_id=None):
-        res = self.base.chat(model, messages, reasoning_effort, max_tokens, session_id=session_id)
-        system, last = messages[0]["content"], messages[-1]["content"]
-        me = re.search(r"Your name in this game is (\w+)\.", system).group(1)
+    def chat(self, model, messages, reasoning_effort, max_tokens, session_id=None, purpose=None, context=None):
+        res = self.base.chat(model, messages, reasoning_effort, max_tokens, session_id=session_id,
+                             purpose=purpose, context=context)
+        ctx = context or {}
+        me = ctx.get("player")
         with self.lock:
-            self.log.append((me, last))
-        if prompts.TASK_VOTE in last and self.vote_fn:
-            n = int(re.search(r"Vote (\d+)\.", messages[1]["content"]).group(1))
-            target = self.vote_fn(n, me, prompts.IMPOSTER_LINE in system)
+            self.log.append((me, purpose))
+        if purpose in ("vote", "vote_retry") and self.vote_fn:
+            target = self.vote_fn(ctx["vote_number"], me, ctx["is_imposter"])
             return dataclasses.replace(res, content=f"Some private reasoning.\nVOTE: {target}")
-        if prompts.TASK_INTRO in last and self.intro_text:
+        if purpose == "intro" and self.intro_text:
             return dataclasses.replace(res, content=self.intro_text)
-        if prompts.TASK_ANSWER in last and self.call_fn:
-            turn_index = last.split(prompts.TRANSCRIPT_END)[0].count("\nQuestion ") + 1
+        if purpose == "answer" and self.call_fn:
+            turn_index = (ctx["round"] - 1) * 4 + ctx["turn"]
             body = parse_vote_call(res.content)[1]
             line = self.call_fn(turn_index, me)
             return dataclasses.replace(res, content=body + (f"\n{line}" if line else ""))
@@ -478,7 +478,7 @@ class TestFullGames(GameTestBase):
                 self.assertNotIn("GPT-6 Luna", p.system_prompt)
             else:
                 self.assertNotIn("Claude Haiku 5.5", p.system_prompt)
-                self.assertIn(prompts.IMPOSTER_LINE, p.system_prompt)
+                self.assertIn("You are the IMPOSTER.", p.system_prompt)
 
     def test_random_mock_games_all_modes(self):
         for i, (ond, mode, rule, calls) in enumerate([("end", "simultaneous", "lie_allowed", False),

@@ -1,0 +1,4 @@
+YOUR SECRET ROLE
+Your name in this game is {name}. You are a member of the trio.
+You are {model_name}. Two of {others} are exact copies of you: the same model, given the same instructions except for their seat name. The remaining one is the imposter, a different AI model.
+Your goal: work out which player is the imposter and vote it out. Be careful not to vote out one of your copies — if a trio member is voted out, the imposter wins.

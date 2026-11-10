@@ -1,0 +1,5 @@
+=== YOUR TASK: VOTE ===
+Your vote could not be counted: {problem}
+Valid choices: {valid_choices}
+{nobody_note}Reply again, ending with exactly one line in this form (if this is still invalid, you abstain):
+VOTE: <Name>

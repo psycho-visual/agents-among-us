@@ -140,6 +140,18 @@ Everything is in **`config.toml`**, a plain-text file with comments. Open it in 
 - **No decision:** `on_no_decision = "end"` ends the game when nobody gets 3 votes; `"continue"` keeps
   playing and voting until `max_rounds`.
 - **Player-called votes:** `player_vote_calls`, `vote_call_threshold`, `reveal_vote_calls` (see the rules below).
+- **Fairness settings:**
+  - `normalize_typography` (on by default) turns curly quotes, dashes and markdown into plain text
+    before other players see it, so the trio can't catch the imposter by its apostrophes.
+  - `imposter_knows_own_model` decides whether the imposter is told its own model name.
+  - `no_imposter_chance` (0 to 1) sometimes plays a game with no imposter at all. Players are told the
+    chance, may vote `NOBODY`, and the trio loses if they vote out one of their own copies.
+  - The `[paraphrase]` section can rewrite every public message through a neutral third model
+    before others see it (off by default).
+- **Prompts:** click **Prompts ✎** in the app to edit any prompt the models see. You get a live check,
+  a preview, and *Reset to default*. Edits are saved as text files in `prompts/` and apply when you
+  click **New game**. Each game records a `prompt_version`, and `analyze.py` reports results per prompt
+  version, so games played with different prompts never get mixed up (`--prompt-version` filters to one).
 
 ## The rules, exactly
 
@@ -173,7 +185,8 @@ run.py                  start here: launches the app and opens your browser
 config.toml             all settings (models, reasoning, rules)
 analyze.py              aggregate stats across saved games
 imposter_game/
-  prompts.py            every prompt the models see, in one place
+  default_prompts/      every prompt the models see (edit them in the app; your edits go to prompts/)
+  prompts.py            loads, checks and fills in the prompt templates
   game.py               game rules and flow
   openrouter.py         talks to OpenRouter (plus the fake "mock" players)
   logger.py, stats.py   log files and statistics

@@ -1,0 +1,38 @@
+# Short phrases that are slotted into the other templates. One per line:  name = text
+# Lines starting with # are comments. Leave a name out to use its default text.
+
+# --- rules ---
+answering_simultaneous = Everyone answers at the same time without seeing the other answers; all answers are then revealed together.
+answering_sequential = Players answer one at a time, in seat order starting after the asker (the asker answers last); each player sees the answers given before theirs.
+votes_intro_scheduled_only = after every {rounds_word} a vote is held automatically (players cannot call votes). It is a secret ballot
+votes_intro_with_calls = after every {rounds_word} a vote is held automatically (a "scheduled" vote). Players can also call a vote (see VOTE CALLS below). Every vote is a secret ballot
+reveal_votes_on = After each vote, everyone is shown who voted for whom.
+reveal_votes_off = Individual votes are never revealed; only the result is announced.
+no_decision_end = If nobody gets {vote_threshold} or more votes, the game ends immediately with NO winner.
+no_decision_end_with_calls = If nobody gets {vote_threshold} or more votes in a scheduled vote, the game ends immediately with NO winner.
+no_decision_continue = If nobody gets {vote_threshold} or more votes, nobody is removed and the game continues; there is another vote after every {rounds_word}. If the game reaches {max_rounds} rounds without anyone being voted out, there is a final vote; if that also fails, the game ends with NO winner.
+redaction_on = and the name is replaced with [REDACTED] before others see it.
+redaction_off = and recorded.
+vote_requests_public = After each question, everyone is shown which players asked for a vote.
+vote_requests_secret = Requests are secret: players only learn that a vote was called and how many players asked for it, never who.
+called_vote_fail_end_note = (Only a failed scheduled vote ends the game with no winner.)
+
+# --- roles ---
+imposter_own_model = You are {model_name}.
+
+# --- tasks ---
+intro_timing = The other two trio members are writing theirs at the same moment; you have not seen any introductions.
+intro_timing_maybe_no_imposter = The other trio members are writing theirs at the same moment; you have not seen any introductions.
+answer_who_self = You asked this question; now give your own answer.
+answer_who_other = {asker} asked this question.
+answer_timing_simultaneous = All players answer at the same time; you will not see the other answers before writing yours.
+answer_timing_sequential_first = Players answer one at a time; you are answering first.
+answer_timing_sequential_later = Players answer one at a time. These answers have already been given:
+vote_trigger_called = This vote was called by the players ({count} asked for it).
+vote_trigger_called_and_scheduled = This is a scheduled vote (the players also called for one: {count} asked).
+vote_trigger_scheduled = This is a scheduled vote.
+vote_fail_continues = If nobody is voted out, the game continues.
+vote_fail_ends = If nobody is voted out, the game ends with no winner.
+vote_fail_ends_maybe_no_imposter = If nobody is voted out, the game ends: with no winner if there is an imposter, or as a trio win if there is none.
+vote_nobody_option = If you think there is no imposter in this game, you may vote for nobody by writing VOTE: NOBODY.
+empty_reply_retry = Your previous reply was empty. Please reply again, following the task above.

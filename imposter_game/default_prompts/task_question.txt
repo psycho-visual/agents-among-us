@@ -1,0 +1,4 @@
+=== YOUR TASK: ASK A QUESTION ===
+Round {round}, question {turn}: it is your turn to ask. Ask ONE question that all four players (you included) will then answer.
+Ask whatever you think best helps you reach your goal.
+At most {word_limit} words. Reply with the question only.
