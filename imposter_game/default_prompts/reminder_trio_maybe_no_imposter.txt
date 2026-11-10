@@ -1,0 +1,1 @@
+(Private reminder: you are a trio member: you are {own_model}. Either two of {others} are copies of you (the same AI model) and the remaining player is the imposter, a different AI model, or there is no imposter and all three are copies of you. Your job is to tell whether any player is not your model, and which.)

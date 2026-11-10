@@ -15,8 +15,10 @@ one-line phrases (`name = text`) that are slotted into the bigger templates.
 How a call is built
 -------------------
 Each model call is stateless and has two messages:
-1. system: rules (same for every player) + role section (differs per player) + output rules.
-2. user:   the public transcript so far (append-only, so prompt caching works), then the task.
+1. system: role section (differs per player) + rules (same for every player) + output rules.
+   The role section comes first so each player reads who it is before the rules.
+2. user:   the public transcript so far (append-only, so prompt caching works), then a one-line
+           private role reminder (reminder_* templates), then the task.
 
 Fairness notes for anyone editing the texts:
 * Trio and imposter receive the same rules text; only the role section differs.
@@ -133,6 +135,18 @@ TEMPLATES: dict[str, TemplateInfo] = {t.id: t for t in [
                  {"name": _P_ROLE["name"], "others": _P_ROLE["others"],
                   "own_model_sentence": "Phrase imposter_own_model plus a space, or empty when "
                                         "imposter_knows_own_model = false."}),
+    TemplateInfo("reminder_trio", "Reminder: trio member", "Roles",
+                 "A one-line private reminder of a trio member's role, placed just above every task.",
+                 {"own_model": "The trio model's display name, e.g. 'Claude Haiku 5.5'.",
+                  "others": _P_ROLE["others"]}),
+    TemplateInfo("reminder_trio_maybe_no_imposter", "Reminder: trio member (maybe no imposter)", "Roles",
+                 "The trio reminder used when the game might have no imposter (no_imposter_chance > 0).",
+                 {"own_model": "The trio model's display name, e.g. 'Claude Haiku 5.5'.",
+                  "others": _P_ROLE["others"]}),
+    TemplateInfo("reminder_imposter", "Reminder: imposter", "Roles",
+                 "A one-line private reminder of the imposter's role, placed just above every task. "
+                 "(It never names the imposter's own model.)",
+                 {"others": _P_ROLE["others"]}),
     TemplateInfo("task_intro", "Task: introduction", "Tasks",
                  "Asks a player to write its introduction blind (trio members; everyone in a no-imposter game).",
                  {"intro_timing": "Phrase intro_timing / intro_timing_maybe_no_imposter.",
@@ -481,10 +495,20 @@ class PromptSet:
                            name=name, others=others, model_name=model_display_name)
 
     def system_prompt(self, name: str, role: str, model_display_name: str, rules, seat_names: list[str]) -> str:
+        """Role section first (who you are), then the shared rules, then output rules."""
         others = [n for n in seat_names if n != name]
-        return "\n\n".join([self.rules_text(rules, seat_names),
-                            self.role_text(name, role, model_display_name, others, rules),
+        return "\n\n".join([self.role_text(name, role, model_display_name, others, rules),
+                            self.rules_text(rules, seat_names),
                             self.render("output_rules")])
+
+    def reminder(self, name: str, role: str, model_display_name: str, seat_names: list[str], rules) -> str:
+        """The private one-line role reminder placed just above every task."""
+        others = _join([n for n in seat_names if n != name])
+        if role == "imposter":
+            return self.render("reminder_imposter", others=others)
+        maybe = float(getattr(rules, "no_imposter_chance", 0.0) or 0.0) > 0
+        return self.render("reminder_trio_maybe_no_imposter" if maybe else "reminder_trio",
+                           own_model=model_display_name, others=others)
 
     # -- tasks -------------------------------------------------------------------
     def intro_task(self, word_limit: int, maybe_no_imposter: bool = False) -> str:
@@ -619,11 +643,13 @@ def private_notes(own_votes: list[tuple[int, str | None]]) -> str:
     return "Your private notes: " + "; ".join(parts) + "."
 
 
-def user_message(transcript: str, task: str, notes: str = "") -> str:
-    """Transcript first (append-only, cache friendly), then private notes, then the task."""
+def user_message(transcript: str, task: str, notes: str = "", reminder: str = "") -> str:
+    """Transcript first (append-only, cache friendly), then private notes, the role reminder, and the task."""
     parts = [transcript]
     if notes:
         parts.append(notes)
+    if reminder:
+        parts.append(reminder)
     parts.append(task)
     return "\n\n".join(parts)
 
@@ -646,16 +672,21 @@ def preview(cfg, prompts_dir: str | Path | None = None) -> dict:
     if calls_on:
         continues = rules.on_no_decision == "continue"
         note = ps.vote_trigger_note("scheduled", None, continues, maybe)
+    trio_reminder = ps.reminder(trio_name, "trio", cfg.trio.display_name, names, rules)
+    imp_reminder = ps.reminder(imp_name, "imposter", cfg.imposter.display_name, names, rules)
+    with_r = lambda r, t: r + "\n\n" + t  # noqa: E731
     return {
         "trio_system": ps.system_prompt(trio_name, "trio", cfg.trio.display_name, rules, names),
         "imposter_system": ps.system_prompt(imp_name, "imposter", cfg.imposter.display_name, rules, names),
         "tasks": {
-            "intro": ps.intro_task(rules.intro_word_limit, maybe),
-            "imposter_intro": ps.imposter_intro_task(sample_intros, rules.intro_word_limit),
-            "question": ps.question_task(1, 1, rules.question_word_limit),
-            "answer": ps.answer_task(names[2], "(sample question)", trio_name, rules.answer_word_limit, None,
-                                     rules.answer_mode == "sequential", calls_on),
-            "vote": ps.vote_task(1, trio_name, valid, rules.vote_threshold, note, allow_nobody=maybe),
+            "intro": with_r(trio_reminder, ps.intro_task(rules.intro_word_limit, maybe)),
+            "imposter_intro": with_r(imp_reminder, ps.imposter_intro_task(sample_intros, rules.intro_word_limit)),
+            "question": with_r(trio_reminder, ps.question_task(1, 1, rules.question_word_limit)),
+            "answer": with_r(trio_reminder, ps.answer_task(names[2], "(sample question)", trio_name,
+                                                           rules.answer_word_limit, None,
+                                                           rules.answer_mode == "sequential", calls_on)),
+            "vote": with_r(trio_reminder, ps.vote_task(1, trio_name, valid, rules.vote_threshold, note,
+                                                       allow_nobody=maybe)),
             "paraphrase": ps.paraphrase_request("(sample message)"),
         },
         "prompt_version": ps.version,
