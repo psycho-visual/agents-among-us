@@ -86,6 +86,7 @@
       tot: { cost: 0, costKnown: false, inTok: 0, outTok: 0, reasonTok: 0, calls: 0, byModel: {}, sources: new Set(), unknownCost: 0 },
       gameOver: null,
       finished: false,
+      lastPhase: null,
     });
   }
   S.order = [];
@@ -444,6 +445,7 @@
       clearAllThinking();
       dropEmptyState();
       let label = ev.label || (ev.phase === "intro" ? "Introductions" : ev.phase === "vote" ? "Vote" : `Round ${ev.round ?? ""}`);
+      S.lastPhase = label;
       if (ev.phase === "vote") {
         S.voteTrigger = ev.trigger || null;
         if (ev.trigger && !/called|scheduled/i.test(label)) label += ` (${TRIGGER_TEXT[ev.trigger] || ev.trigger})`;
@@ -685,7 +687,13 @@
     let text, next = "", state = st ? st.state : "connecting";
     if (!connected) { text = "Connecting to the game server…"; state = "connecting"; }
     else if (!st) text = "Loading…";
-    else if (!st.has_game) text = st.config_error ? "Can't start a game yet — see the message above." : "Setting up a new game…";
+    else if (st.batch && st.batch.active) {
+      const B = window.AAUBatch;
+      const where = st.next_label || S.lastPhase || "starting the next game…";
+      text = (B ? B.label() : "Batch") + " — " + where;
+      state = "running";
+      next = [thinkingText(), st.batch.stopping ? "will stop after this game" : ""].filter(Boolean).join(" · ");
+    } else if (!st.has_game) text = st.config_error ? "Can't start a game yet — see the message above." : "Setting up a new game…";
     else if (st.state === "running") {
       const th = thinkingText();
       text = "Running — " + (th || "working…");
@@ -710,18 +718,22 @@
     const has = !!(st && st.has_game);
     const state = st ? st.state : "connecting";
     const runningish = state === "running" || state === "pausing";
-    const canPlay = connected && has && !busy && (state === "idle" || state === "paused") && !st.finished;
-    $("btn-new").disabled = !connected || busy || runningish;
+    const inBatch = !!(st && st.batch && st.batch.active);
+    const canPlay = connected && has && !busy && !inBatch && (state === "idle" || state === "paused") && !st.finished;
+    $("btn-new").disabled = !connected || busy || runningish || inBatch;
+    $("btn-batch").disabled = !connected || busy || runningish || inBatch;
+    $("btn-batch").title = inBatch ? "A batch is running — see the batch panel" : runningish ? "Pause the current game first"
+      : "Play many games in a row automatically, until a limit is reached";
     $("btn-next").disabled = !canPlay;
-    $("btn-all").disabled = !(canPlay || (connected && !busy && state === "running" && st.mode === "round"));
-    $("btn-pause").disabled = !(connected && state === "running");
+    $("btn-all").disabled = !(canPlay || (connected && !busy && !inBatch && state === "running" && st.mode === "round"));
+    $("btn-pause").disabled = !(connected && state === "running" && !inBatch);
     const parts = st && st.next_label ? String(st.next_label).split(" · ") : [];
     const label = parts[0] || "";
     // "Round 2 · Green asks" where Green is not the first seat means we stopped mid-round.
     const asker = parts[1] ? parts[1].replace(/\s+asks$/, "") : "";
     const midRound = /^Round\b/.test(label) && asker && S.order.length && S.order[0] !== asker;
     const nb = $("btn-next");
-    nb.textContent = label && !st.finished ? `${midRound ? "Finish" : "Next:"} ${label} ▶` : "Next round ▶";
+    nb.textContent = label && !st.finished && !inBatch ? `${midRound ? "Finish" : "Next:"} ${label} ▶` : "Next round ▶";
     nb.title = st && st.next_label ? `Play until the end of: ${st.next_label}` : "Play until the end of the next round (or vote)";
     $("btn-pause").textContent = state === "pausing" ? "Pausing…" : "Pause ⏸";
   }
@@ -737,7 +749,7 @@
     renderMockBadge();
     renderStatus();
     renderControls();
-    if (!st.has_game && !st.config_error && !autoCreated) {
+    if (!st.has_game && !st.config_error && !autoCreated && !(st.batch && st.batch.active)) {
       autoCreated = true;
       post("/api/new_game");
     }
@@ -963,6 +975,11 @@
   function dispatch(ev) {
     if (!ev || typeof ev !== "object") return;
     if (ev.type === "status") { onStatus(ev); return; }
+    if (typeof ev.type === "string" && ev.type.startsWith("batch_")) {
+      if (window.AAUBatch) { try { window.AAUBatch.handle(ev); } catch (e) { console.error("batch event", ev, e); } }
+      renderStatus();
+      return;
+    }
     if (ev.game_id && ev.game_id !== S.gameId) resetGame(ev.game_id);
     if (typeof ev.seq === "number") {
       if (ev.seq <= S.lastSeq) return; // duplicate (e.g. replay overlap)
@@ -982,6 +999,7 @@
       // The server replays the whole current game on every (re)connect.
       S.gameId = null;
       resetGame(null);
+      if (window.AAUBatch) window.AAUBatch.reset();
       renderStatus();
       renderControls();
     };
@@ -999,6 +1017,8 @@
       }
     };
   }
+
+  window.AAUApp = { banner, clearBanner, loadStats, renderStatus, renderControls, fmtUSD, status: () => status };
 
   // Keep the sticky sidebar just below the (possibly wrapping) sticky header.
   const topEl = document.querySelector(".sticky-top");

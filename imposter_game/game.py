@@ -343,13 +343,17 @@ class Game:
 
     def __init__(self, cfg: GameConfig, client, on_event: Callable[[dict], None] | None = None,
                  log_dir: Path = Path("logs"), mock: bool = False, seed: int | None = None,
-                 prompts_dir: str | Path | None = None, templates: dict[str, str] | None = None):
+                 prompts_dir: str | Path | None = None, templates: dict[str, str] | None = None,
+                 batch_id: str | None = None, batch_index: int | None = None, roles_swapped: bool = False):
         self.cfg = cfg
         self.rules = cfg.rules
         self.client = client
         self.on_event = on_event
         self.mock = mock
         self.seed = seed
+        self.batch_id = batch_id              # set when this game is part of a batch (batch.py / Batch button)
+        self.batch_index = batch_index        # 1-based position in the batch
+        self.roles_swapped = roles_swapped    # batch alternate_roles: trio/imposter models swapped for this game
         self.game_id = _new_game_id()
         self.logger = GameLogger(log_dir, self.game_id, mock)
         while self.logger.json_path.exists():
@@ -425,7 +429,8 @@ class Game:
 
         self._emit("game_started", mock=mock, config=self._config_summary(),
                    players=[p.public_dict() for p in self.players], has_imposter=self.has_imposter,
-                   prompt_version=self.prompts.version, prompts_modified=self.prompts.modified)
+                   prompt_version=self.prompts.version, prompts_modified=self.prompts.modified,
+                   batch_id=batch_id, batch_index=batch_index, roles_swapped=roles_swapped)
         for w in self.prompts.warnings:
             self._emit("error", message=w, fatal=False, player=None)
         # Log files are only created once the first step() runs, so a game that
@@ -938,6 +943,7 @@ class Game:
         with self._lock:
             return {
                 "schema_version": SCHEMA_VERSION, "game_id": self.game_id, "mock": self.mock, "seed": self.seed,
+                "batch_id": self.batch_id, "batch_index": self.batch_index, "roles_swapped": self.roles_swapped,
                 "started_at": self.started_at, "finished_at": self.finished_at,
                 "config": self._config_summary(),
                 "players": [p.public_dict() for p in self.players],
@@ -1019,5 +1025,6 @@ class Game:
             "reasoning_returned": dict(self.reasoning_returned),
             "cost_sources": sorted(self.cost_sources),
             "log_file": str(self.logger.json_path),
+            "batch_id": self.batch_id, "batch_index": self.batch_index, "roles_swapped": self.roles_swapped,
             "end_reason": self.end_reason,
         }

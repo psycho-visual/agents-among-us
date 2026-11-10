@@ -162,6 +162,40 @@ max_output_tokens = 1000
 
 
 # -----------------------------------------------------------------------------
+#  Batch mode: play many games in a row
+# -----------------------------------------------------------------------------
+#  Start a batch with the "Batch" button in the browser, or from a terminal:
+#      python batch.py            (add --mock to try it for free)
+#  A batch stops at whichever limit comes first. Command-line flags override these.
+[batch]
+# Maximum number of games. 0 = no game limit (then budget_usd must be set).
+games = 20
+
+# Stop before spending more than this many US dollars in this batch.
+# A new game only starts if the most expensive game so far would still fit.
+# "" = no spending limit (then games must be more than 0).
+budget_usd = 1.00
+
+# Optional safety net: before each game, check how much credit is left on your
+# OpenRouter account/key and stop if it is below this amount. "" = don't check.
+min_credit_usd = ""
+
+# true = every second game swaps the trio and imposter models, so both models
+# play both roles equally often.
+alternate_roles = false
+
+# Stop the batch after this many games IN A ROW end in an error (0 = never).
+stop_after_errors = 3
+
+# How many games python batch.py plays at the same time (the browser always
+# plays one at a time so you can watch). Between 1 and 8.
+parallel = 1
+
+# Cost guess used by the spending limit until the first game has finished.
+first_game_estimate_usd = 0.10
+
+
+# -----------------------------------------------------------------------------
 #  API settings (OpenRouter)
 # -----------------------------------------------------------------------------
 [api]

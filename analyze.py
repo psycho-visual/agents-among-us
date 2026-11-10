@@ -4,6 +4,8 @@
     python analyze.py --include-mock   real + mock games
     python analyze.py --mock-only      mock games only (logs/mock/summary.jsonl)
     python analyze.py --csv games.csv  also write one row per game to a CSV file
+    python analyze.py --list-batches   one line per batch (python batch.py / the Batch button)
+    python analyze.py --batch b20261110-181500-ab12   only the games of that batch
     python analyze.py --prompt-version 1a2b3c4d   only games played with that prompt version
                                                   ("legacy" = games from before prompt versions)
 
@@ -133,6 +135,7 @@ CSV_FIELDS = ["game_id", "timestamp", "mock", "trio_model", "imposter_model", "t
               "player_vote_calls", "vote_call_threshold", "outcome", "winner", "winner_model", "eliminated", "eliminated_role",
               "eliminated_model", "eliminated_by", "rounds_survived", "imposter_rounds_survived", "rounds_completed",
               "turns_completed", "called_votes", "scheduled_votes", "vote_requests_by_model",
+              "batch_id", "batch_index", "roles_swapped",
               "imposter_votes_received_by_trio", "total_cost_usd", "total_input_tokens", "total_output_tokens",
               "num_api_calls", "cost_by_model", "reasoning_returned", "log_file"]
 
@@ -145,6 +148,30 @@ def write_csv(rows: list[dict], path: Path) -> None:
             w.writerow({k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in r.items()})
 
 
+def print_batches(rows: list[dict], label: str, base: Path, out=None) -> None:
+    """One line per batch_id: games, outcomes, caught rate, cost, models."""
+    out = out or sys.stdout
+    batches: dict[str, list[dict]] = {}
+    for r in rows:
+        if r.get("batch_id"):
+            batches.setdefault(r["batch_id"], []).append(r)
+    if not batches:
+        print(f"No batches found ({label}) in {base}. Start one with: python batch.py", file=out)
+        return
+    print(f"Batches ({label})", file=out)
+    table_rows = []
+    for bid, games in sorted(batches.items(), key=lambda kv: min(str(g.get("timestamp")) for g in kv[1])):
+        s = compute_stats(games)
+        caught = s["imposter_caught"]
+        models = sorted({f"{g.get('trio_model')} vs {g.get('imposter_model')}" for g in games})
+        table_rows.append([bid, len(games), sum(1 for g in games if g.get("roles_swapped")),
+                           caught["caught"], caught["decisive_games"], pct(caught["rate"]),
+                           s["outcomes"].get("no_decision", 0), s["outcomes"].get("error", 0),
+                           money(s["cost_usd"]["total"]), "; ".join(models)])
+    table(["batch", "games", "swapped", "caught", "decisive", "catch rate", "no decision", "errors", "cost",
+           "models (trio vs imposter)"], table_rows, out)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Summarise finished Agents Among Us games.")
     g = ap.add_mutually_exclusive_group()
@@ -153,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--csv", metavar="PATH", help="write one row per game to this CSV file")
     ap.add_argument("--prompt-version", metavar="X",
                     help='only games played with this prompt version ("legacy" = before prompt versions)')
+    ap.add_argument("--batch", metavar="BATCH_ID", help="only games from this batch")
+    ap.add_argument("--list-batches", action="store_true", help="list batches (one line each) and exit")
     ap.add_argument("--log-dir", default="logs", help="log folder (default: logs in the repo folder)")
     args = ap.parse_args(argv)
 
@@ -161,6 +190,18 @@ def main(argv: list[str] | None = None) -> int:
     mock = read_summary(base / "mock" / "summary.jsonl") if (args.include_mock or args.mock_only) else []
     rows = real + mock
     label = "mock games" if args.mock_only else ("real + mock games" if args.include_mock else "real games")
+    if args.list_batches:
+        print_batches(rows, label, base)
+        return 0
+    if args.batch:
+        total = len(rows)
+        rows = [r for r in rows if r.get("batch_id") == args.batch]
+        label += f", batch {args.batch}"
+        if total and not rows:
+            ids = sorted({r["batch_id"] for r in real + mock if r.get("batch_id")})
+            print(f"No games from batch {args.batch}." + (f" Batches found: {', '.join(ids)}" if ids else
+                                                           " No batches found (see --list-batches)."))
+            return 0
     if args.prompt_version:
         total = len(rows)
         rows = [r for r in rows if prompt_version_of(r) == args.prompt_version]
