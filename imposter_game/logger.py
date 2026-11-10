@@ -108,7 +108,11 @@ def render_markdown(record: dict) -> str:
                 out += [f"### {ev['player']} asks (round {ev.get('round')}, question {ev.get('turn')})", ""]
                 out += [_quote(ev.get("text")), ""]
             else:
-                out += [who + ":", "", _quote(ev.get("text")), ""]
+                flag = ""
+                if ev.get("kind") == "answer" and "wants_vote" in ev:
+                    flag = {True: " — *asked for a vote*", False: "", None: " — *(no vote-request line)*"}[
+                        ev.get("wants_vote")]
+                out += [who + flag + ":", "", _quote(ev.get("text")), ""]
             if ev.get("original_text") and ev.get("original_text") != ev.get("text"):
                 out += ["<details><summary>original (before cleanup/redaction)</summary>", "",
                         _quote(ev["original_text"]), "", "</details>", ""]
@@ -117,6 +121,10 @@ def render_markdown(record: dict) -> str:
         elif t == "rule_violation":
             out += [f"*Name-rule violation by {ev['player']}: {', '.join(ev.get('matches', []))}"
                     f"{' (redacted)' if ev.get('redacted') else ''}*", ""]
+        elif t == "vote_call_check":
+            req = ", ".join(ev.get("requesters") or []) or "none"
+            out += [f"*Vote requests after this question: {req} ({ev.get('count')} of {ev.get('threshold')} needed)"
+                    + (" → **a vote is called**" if ev.get("triggered") else "") + "*", ""]
         elif t == "vote_cast":
             target = ev.get("target") or "abstained"
             flag = "" if ev.get("valid") else " (invalid → abstain)"
@@ -124,7 +132,7 @@ def render_markdown(record: dict) -> str:
         elif t == "vote_result":
             tally = ", ".join(f"{k}: {v}" for k, v in ev.get("tally", {}).items())
             elim = ev.get("eliminated")
-            out += [f"**Vote {ev.get('vote_number')} result:** {tally}. "
+            out += [f"**Vote {ev.get('vote_number')} ({ev.get('trigger', 'scheduled')}) result:** {tally}. "
                     + (f"{elim} ({ev.get('eliminated_role')}) is voted out." if elim else "Nobody is voted out.")
                     + f" → `{ev.get('decision')}`", ""]
         elif t == "error":
@@ -134,8 +142,11 @@ def render_markdown(record: dict) -> str:
                     f"- Outcome: **{ev.get('outcome')}** (winner: {ev.get('winner') or 'none'})",
                     f"- Eliminated: {ev.get('eliminated') or 'nobody'}"
                     + (f" ({ev.get('eliminated_role')}), after {ev.get('rounds_survived')} round(s)"
+                       + (f", in a {ev['eliminated_by']} vote" if ev.get("eliminated_by") else "")
                        if ev.get("eliminated") else ""),
-                    f"- Rounds completed: {ev.get('rounds_completed')}"]
+                    f"- Rounds completed: {ev.get('rounds_completed')}"
+                    + (f" ({ev.get('turns_completed')} question turns)" if ev.get("turns_completed") is not None
+                       else "")]
             if ev.get("reason"):
                 out.append(f"- Reason: {ev['reason']}")
             out.append("")

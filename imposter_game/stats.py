@@ -106,6 +106,23 @@ def compute_stats(rows: list[dict]) -> dict:
     survived = [r["rounds_survived"] for r in played if isinstance(r.get("rounds_survived"), (int, float))]
     imp_survived = [r["imposter_rounds_survived"] for r in played
                     if isinstance(r.get("imposter_rounds_survived"), (int, float))]
+    votes_by_trigger: dict[str, int] = {}
+    elim_by_trigger: dict[str, int] = {}
+    requests: dict[str, dict] = {}
+    for r in played:
+        for v in r.get("votes") or []:
+            trig = v.get("trigger") or "scheduled"
+            votes_by_trigger[trig] = votes_by_trigger.get(trig, 0) + 1
+        if r.get("eliminated"):
+            trig = r.get("eliminated_by") or "scheduled"
+            elim_by_trigger[trig] = elim_by_trigger.get(trig, 0) + 1
+        for model, c in (r.get("vote_requests_by_model") or {}).items():
+            rec = requests.setdefault(model, {"yes": 0, "no": 0, "missing": 0})
+            for k in rec:
+                rec[k] += int((c or {}).get(k) or 0)
+    for rec in requests.values():
+        rec["yes_rate"] = _rate(rec["yes"], rec["yes"] + rec["no"] + rec["missing"])
+
     costs = [float(r["total_cost_usd"]) for r in rows if isinstance(r.get("total_cost_usd"), (int, float))]
     tin = [r.get("total_input_tokens") or 0 for r in rows]
     tout = [r.get("total_output_tokens") or 0 for r in rows]
@@ -123,6 +140,16 @@ def compute_stats(rows: list[dict]) -> dict:
         "rounds_survived": _num_summary(survived),
         "imposter_rounds_survived": _num_summary(imp_survived),
         "rounds_completed": _num_summary([r.get("rounds_completed") or 0 for r in played]),
+        "turns_completed": _num_summary([r.get("turns_completed") or 0 for r in played
+                                         if r.get("turns_completed") is not None]),
+        "vote_calls": {
+            "games_with_vote_calls": sum(1 for r in rows if r.get("player_vote_calls")),
+            "called_votes": sum(int(r.get("called_votes") or 0) for r in played),
+            "scheduled_votes": sum(int(r.get("scheduled_votes") or 0) for r in played),
+            "votes_by_trigger": votes_by_trigger,
+            "eliminations_by_trigger": elim_by_trigger,
+            "vote_requests_by_model": requests,
+        },
         "cost_usd": _num_summary(costs),
         "tokens": {"mean_input": mean(tin) if tin else None, "mean_output": mean(tout) if tout else None,
                    "total_input": sum(tin), "total_output": sum(tout)},

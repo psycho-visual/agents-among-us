@@ -76,7 +76,10 @@
       callTargets: {},      // call_id -> [{cost, chips}]
       violations: {},       // call_id -> [rule_violation events]
       turns: {},            // question_id -> {el, answers, asker}
+      turnsByRT: {},        // "round-turn" -> same turn object (for vote_call_check)
       introBox: null,
+      voteTrigger: null,    // trigger of the vote phase in progress
+      lastCall: null,       // {round, turn} of the last vote_call_check that triggered a vote
       votes: {},            // vote_number -> {el, ballots, result}
       tot: { cost: 0, costKnown: false, inTok: 0, outTok: 0, reasonTok: 0, calls: 0, byModel: {}, sources: new Set(), unknownCost: 0 },
       gameOver: null,
@@ -218,6 +221,10 @@
     if (r.answer_mode) rules.push(`${r.answer_mode} answers`);
     if (r.rounds_before_vote) rules.push(`vote every ${plural(r.rounds_before_vote, "round")}`);
     if (r.vote_threshold) rules.push(`${plural(r.vote_threshold, "vote")} to eliminate`);
+    if (r.player_vote_calls === true) {
+      rules.push(`players can call votes (${r.vote_call_threshold ?? "?"} requests` +
+        (r.reveal_vote_calls === true ? ", requests public)" : ", requests secret)"));
+    }
     if (r.on_no_decision) rules.push(r.on_no_decision === "continue" ? `keep going if undecided (max ${r.max_rounds} rounds)` : "ends if undecided");
     if (rules.length) parts.push(el("div", null, el("b", null, "Rules: "), rules.join(" · ")));
     $("settings").replaceChildren(...parts);
@@ -304,15 +311,43 @@
   }
   const seatIndex = (name) => { const i = S.order.indexOf(name); return i >= 0 ? i : 99; };
 
+  const rulesCfg = () => (S.config && (S.config.rules || S.config)) || {};
+  // Vote requests are private unless the config makes them public; private ones are spoilers in detective mode.
+  const voteCallsPublic = () => rulesCfg().reveal_vote_calls === true;
+  const TRIGGER_TEXT = { called: "called by the players", scheduled: "scheduled", "called+scheduled": "called by the players + scheduled" };
+  const isCalled = (t) => typeof t === "string" && t.startsWith("called");
+  function triggerChip(trigger) {
+    if (!trigger) return null;
+    return el("span", { class: "chip " + (isCalled(trigger) ? "chip-called" : "chip-scheduled") },
+      isCalled(trigger) ? "🗳 " + (TRIGGER_TEXT[trigger] || trigger) : (TRIGGER_TEXT[trigger] || trigger));
+  }
+  function wantsVoteChip(ev) {
+    if (ev.kind !== "answer" || !("wants_vote" in ev)) return null;
+    const cls = voteCallsPublic() ? "" : " spoiler";
+    if (ev.wants_vote === true) return el("span", { class: "chip chip-called" + cls, title: "This player asked for a vote to be held now" }, "🗳 wants a vote");
+    if (ev.wants_vote === null && rulesCfg().player_vote_calls !== false) {
+      return el("span", { class: "chip" + cls, title: "No CALL VOTE: YES/NO line was found; counted as NO" }, "no vote line");
+    }
+    return null;
+  }
+
+  // The engine strips the "CALL VOTE: YES/NO" line from public text; that alone is not a redaction.
+  const CALL_VOTE_LINE = /^[\s*_>#`-]*call[\s*_]*vote\b.*$/gim;
+  function originalDiffers(ev) {
+    if (ev.original_text == null || ev.original_text === ev.text) return false;
+    const norm = (t) => String(t ?? "").replace(CALL_VOTE_LINE, "").replace(/\s+/g, " ").trim();
+    return norm(ev.original_text) !== norm(ev.text);
+  }
+
   function messageEl(ev) {
     const costSlot = el("span", { class: "cost-slot" });
     const chipSlot = el("span", { class: "chip-slot" });
     const verb = { intro: "introduces themself", question: "asks", answer: "answers" }[ev.kind] || ev.kind;
     const node = el("article", { class: `msg kind-${ev.kind}`, style: { "--seat": seatColor(ev.player) } },
-      el("div", { class: "msg-head" }, nameTag(ev.player), el("span", { class: "muted small verb" }, verb), chipSlot,
+      el("div", { class: "msg-head" }, nameTag(ev.player), el("span", { class: "muted small verb" }, verb), wantsVoteChip(ev), chipSlot,
         el("span", { class: "spacer" }), costSlot),
       el("div", { class: "msg-text pre" }, ev.text == null ? "" : String(ev.text)),
-      ev.original_text != null && ev.original_text !== ev.text
+      originalDiffers(ev)
         ? el("details", { class: "original" }, el("summary", null, "Original text (before redaction)"),
           el("div", { class: "pre" }, String(ev.original_text)))
         : null,
@@ -331,11 +366,13 @@
     dropEmptyState();
     const ballots = el("div", { class: "ballots" });
     const result = el("div", { class: "vote-result-slot" });
-    const node = el("section", { class: "vote-block" },
-      el("h3", null, `Vote ${n ?? ""}`.trim(), el("span", { class: "muted small" }, " · secret ballot, everyone votes at once")),
+    const trigger = S.voteTrigger;
+    const node = el("section", { class: "vote-block" + (isCalled(trigger) ? " called" : "") },
+      el("h3", null, `Vote ${n ?? ""}`.trim(), " ", triggerChip(trigger),
+        el("span", { class: "muted small" }, " · secret ballot, everyone votes at once")),
       ballots, result);
     T.append(node);
-    return (S.votes[key] = { el: node, ballots, result });
+    return (S.votes[key] = { el: node, ballots, result, trigger, calledAt: isCalled(trigger) ? S.lastCall : null });
   }
 
   // ------------------------------------------------------------------ event handlers
@@ -357,8 +394,12 @@
     phase(ev) {
       clearAllThinking();
       dropEmptyState();
-      const label = ev.label || (ev.phase === "intro" ? "Introductions" : ev.phase === "vote" ? "Vote" : `Round ${ev.round ?? ""}`);
-      T.append(phaseHeader(label, ev.phase));
+      let label = ev.label || (ev.phase === "intro" ? "Introductions" : ev.phase === "vote" ? "Vote" : `Round ${ev.round ?? ""}`);
+      if (ev.phase === "vote") {
+        S.voteTrigger = ev.trigger || null;
+        if (ev.trigger && !/called|scheduled/i.test(label)) label += ` (${TRIGGER_TEXT[ev.trigger] || ev.trigger})`;
+      }
+      T.append(phaseHeader(label, ev.phase === "vote" && isCalled(ev.trigger) ? "vote phase-called" : ev.phase));
       if (ev.phase === "intro") {
         S.introBox = el("div", { class: "intros" });
         T.append(S.introBox);
@@ -381,7 +422,9 @@
         const turn = el("section", { class: "turn", style: { "--seat": seatColor(ev.player) } },
           el("div", { class: "turn-head small muted" }, title ? title + " — " : "", nameTag(ev.player), " asks everyone"),
           node, answers);
-        S.turns[ev.question_id || `q-${ev.call_id}`] = { el: turn, answers, asker: ev.player };
+        const tobj = { el: turn, answers, asker: ev.player };
+        S.turns[ev.question_id || `q-${ev.call_id}`] = tobj;
+        if (ev.round != null && ev.turn != null) S.turnsByRT[`${ev.round}-${ev.turn}`] = tobj;
         T.append(turn);
       } else if (ev.kind === "answer" && ev.question_id && S.turns[ev.question_id]) {
         const t = S.turns[ev.question_id];
@@ -417,6 +460,25 @@
       renderStatus();
     },
 
+    vote_call_check(ev) {
+      const reqs = Array.isArray(ev.requesters) ? ev.requesters.slice().sort((a, b) => seatIndex(a) - seatIndex(b)) : [];
+      const count = typeof ev.count === "number" ? ev.count : reqs.length;
+      const thr = ev.threshold ?? rulesCfg().vote_call_threshold ?? "?";
+      const names = reqs.length
+        ? el("span", { class: voteCallsPublic() ? "" : "spoiler-inline" }, " — ", reqs.map((n, i) => [i ? ", " : "", nameTag(n)]))
+        : null;
+      const line = ev.triggered
+        ? el("div", { class: "vote-call triggered" },
+          el("strong", null, "🗳 Vote called by the players!"),
+          el("span", null, ` ${count} of ${S.order.length || 4} asked for one (${thr} needed)`), names,
+          el("span", { class: "muted small" }, " · the vote happens next"))
+        : el("div", { class: "vote-call small" + (count ? "" : " none") },
+          el("span", { class: "muted" }, "🗳 Vote requests: "), el("b", null, `${count} / ${thr} needed`), names);
+      if (ev.triggered && ev.round != null && ev.turn != null) S.lastCall = { round: ev.round, turn: ev.turn };
+      const t = ev.round != null && ev.turn != null ? S.turnsByRT[`${ev.round}-${ev.turn}`] : null;
+      if (t) t.el.append(line); else T.append(line);
+    },
+
     vote_result(ev) {
       clearAllThinking();
       const vb = voteBlock(ev.vote_number);
@@ -434,16 +496,22 @@
       switch (ev.decision) {
         case "trio_win": headline = [nameTag(elim), " was voted out — and was the imposter! The trio wins."]; cls = "good"; break;
         case "imposter_win": headline = [nameTag(elim), " was voted out — but was a trio member. The imposter wins!"]; cls = "bad"; break;
-        case "continue": headline = [`Nobody reached ${thr} votes — the game continues.`]; cls = "neutral"; break;
+        case "continue": headline = [`Nobody reached ${thr} votes — ${isCalled(ev.trigger || vb.trigger) ? "the called vote failed, " : ""}the game continues.`]; cls = "neutral"; break;
         case "no_decision": headline = [`Nobody reached ${thr} votes — no decision.`]; cls = "neutral"; break;
         default: headline = [elim ? [nameTag(elim), ` was voted out (${role || "unknown role"}).`] : "No one was voted out."]; cls = "neutral";
       }
       const tallyRows = Object.entries(tally).sort((a, b) => b[1] - a[1] || seatIndex(a[0]) - seatIndex(b[0]));
+      const trig = ev.trigger || vb.trigger;
       vb.result.replaceChildren(el("div", { class: `vote-result ${cls}` },
+        trig ? el("div", { class: "small" }, triggerChip(trig), isCalled(trig) ? " a vote the players asked for" : " a regularly scheduled vote") : null,
         el("div", { class: "vote-headline" }, headline),
         el("div", { class: "tally" }, el("span", { class: "muted small" }, "Tally: "),
           tallyRows.length ? tallyRows.map(([n, c]) => el("span", { class: "tally-item" }, nameTag(n), ` ${c}`)) : el("span", { class: "muted small" }, "no valid votes")),
-        ev.rounds_completed != null ? el("div", { class: "muted small" }, `After ${plural(ev.rounds_completed, "complete round")}.`) : null));
+        ev.rounds_completed == null ? null
+          : el("div", { class: "muted small" }, isCalled(trig) && vb.calledAt
+            ? `Called after round ${vb.calledAt.round}, turn ${vb.calledAt.turn} (${plural(ev.rounds_completed, "complete round")} so far).`
+            : `After ${plural(ev.rounds_completed, "complete round")}.`)));
+      S.voteTrigger = null;
       renderPlayers();
     },
 
@@ -515,7 +583,11 @@
       rows.push(["Voted out", "nobody"]);
     }
     if (ip) rows.push(["The imposter was", [nameTag(imposter), ` — ${ip.display_name || ip.model || ""}${ip.reasoning_effort ? ` (effort ${ip.reasoning_effort})` : ""}`]]);
-    if (ev.rounds_completed != null) rows.push(["Rounds played", String(ev.rounds_completed)]);
+    if (ev.rounds_completed != null) rows.push(["Rounds played", String(ev.rounds_completed) + (ev.turns_completed != null ? ` (${plural(ev.turns_completed, "question turn")})` : "")]);
+    else if (ev.turns_completed != null) rows.push(["Question turns", String(ev.turns_completed)]);
+    const nVotes = Object.keys(S.votes).length;
+    const nCalled = Object.values(S.votes).filter((v) => isCalled(v.trigger)).length;
+    if (nVotes) rows.push(["Votes held", `${nVotes}` + (nCalled ? ` (${nCalled} called by the players)` : "")]);
     const costNote = S.tot.sources.has("estimated") ? " (estimated)" : (S.mock || S.tot.sources.has("mock")) ? " (mock)" : "";
     rows.push(["Total cost", fmtUSD(typeof ev.total_cost_usd === "number" ? ev.total_cost_usd : S.tot.cost) + costNote]);
     rows.push(["Tokens", `${fmtInt(ev.total_input_tokens ?? S.tot.inTok)} in · ${fmtInt(ev.total_output_tokens ?? S.tot.outTok)} out · ${fmtInt(ev.num_api_calls ?? S.tot.calls)} API calls`]);

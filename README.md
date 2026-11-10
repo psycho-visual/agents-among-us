@@ -139,6 +139,7 @@ Everything is in **`config.toml`**, a plain-text file with comments. Open it in 
 - **Rounds before a vote:** `rounds_before_vote`.
 - **No decision:** `on_no_decision = "end"` ends the game when nobody gets 3 votes; `"continue"` keeps
   playing and voting until `max_rounds`.
+- **Player-called votes:** `player_vote_calls`, `vote_call_threshold`, `reveal_vote_calls` (see the rules below).
 
 ## The rules, exactly
 
@@ -153,7 +154,12 @@ Everything is in **`config.toml`**, a plain-text file with comments. Open it in 
    - Imposter out → **trio wins**.
    - A trio member out → **imposter wins**.
    - Nobody reaches 3 → **no decision** (with the default settings).
-4. **What players know.** Everyone knows whether they are the imposter. Trio members are told their own
+4. **Players can call a vote** (`player_vote_calls = true`). Every answer ends with a hidden line,
+   `CALL VOTE: YES` or `CALL VOTE: NO`, which is removed before other players see the answer. If at least
+   `vote_call_threshold` players (default 3) say YES after the same question, a vote is held right away.
+   A called vote that removes nobody doesn't end the game; play just continues. Requests are secret unless
+   `reveal_vote_calls = true`. Set `player_vote_calls = false` to go back to scheduled votes only.
+5. **What players know.** Everyone knows whether they are the imposter. Trio members are told their own
    model name and that two other players are copies of themselves (not which ones). The imposter is not
    told which model the trio is.
 

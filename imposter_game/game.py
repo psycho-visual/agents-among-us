@@ -7,7 +7,10 @@ server calls step() in a loop, which lets it pause between steps.
 The rules that someone may want to tweak live in small functions near the top
 of this file:
 
-    vote_due(rounds_completed, rules)       when is a vote held?
+    vote_due(rounds_completed, rules)       when is a scheduled vote held?
+    vote_call_triggered(requesters, rules)  have enough players called a vote?
+    vote_trigger(called, scheduled)         which kind of vote (if any) happens next?
+    parse_vote_call(text)                   reading "CALL VOTE: YES/NO" from an answer
     resolve_vote(ballots, cfg)              who (if anyone) is voted out?
     decide_after_vote(...)                  does the game end, and who won?
     parse_vote(text, me, names)             reading "VOTE: <Name>" from a reply
@@ -81,12 +84,40 @@ def resolve_vote(ballots: dict[str, str | None], cfg) -> VoteOutcome:
     return VoteOutcome(tally=tally, eliminated=eliminated, top=top)
 
 
-def decide_after_vote(eliminated_role: str | None, rounds_completed: int, rules) -> str:
-    """'trio_win' | 'imposter_win' | 'no_decision' (game ends) | 'continue' (play on)."""
+def vote_call_triggered(requesters: list[str], rules) -> bool:
+    """Players call a vote when at least `vote_call_threshold` of them asked in the same turn."""
+    return bool(getattr(rules, "player_vote_calls", False)) and len(requesters) >= rules.vote_call_threshold
+
+
+def vote_trigger(called: bool, scheduled: bool) -> str | None:
+    """What kind of vote happens next: 'scheduled', 'called', 'called+scheduled' (one merged vote), or None."""
+    if called and scheduled:
+        return "called+scheduled"
+    if called:
+        return "called"
+    if scheduled:
+        return "scheduled"
+    return None
+
+
+def vote_label(number: int, trigger: str) -> str:
+    return {"called": f"Vote {number} (called by players)",
+            "called+scheduled": f"Vote {number} (scheduled + called by players)"}.get(trigger, f"Vote {number}")
+
+
+def decide_after_vote(eliminated_role: str | None, rounds_completed: int, rules,
+                      trigger: str = "scheduled") -> str:
+    """'trio_win' | 'imposter_win' | 'no_decision' (game ends) | 'continue' (play on).
+
+    A failed CALLED vote always continues. Scheduled (and merged called+scheduled)
+    votes follow `on_no_decision`.
+    """
     if eliminated_role == "imposter":
         return "trio_win"
     if eliminated_role == "trio":
         return "imposter_win"
+    if trigger == "called":
+        return "continue"
     if rules.on_no_decision == "continue" and rounds_completed < rules.max_rounds:
         return "continue"
     return "no_decision"
@@ -111,6 +142,28 @@ def parse_vote(text: str, me: str, names: list[str]) -> tuple[str | None, str | 
                 return n, None
         return None, f'"{raw}" is not one of the players you can vote for.'
     return None, 'your reply did not end with a line of the form "VOTE: <Name>".'
+
+
+_CALL_RE = re.compile(
+    r"[*_`]*\bcall[ \t]*(?:a[ \t]+)?vote\b[*_`]*[ \t]*[:：=\-–—][ \t]*[*_`]*[ \t]*([A-Za-z]*)[*_`.!]*",
+    re.IGNORECASE)
+
+
+def parse_vote_call(text: str) -> tuple[bool | None, str]:
+    """Read the LAST 'CALL VOTE: YES/NO' and remove every such line from the text.
+
+    Returns (wants_vote, text_without_the_line). wants_vote is None if the line
+    is missing or unreadable (which counts as NO).
+    """
+    text = text or ""
+    matches = list(_CALL_RE.finditer(text))
+    if not matches:
+        return None, text.strip()
+    word = matches[-1].group(1).lower()
+    wants = True if word in ("yes", "y", "true") else False if word in ("no", "n", "false") else None
+    stripped = _CALL_RE.sub("", text)
+    stripped = "\n".join(line.rstrip() for line in stripped.splitlines()).strip()
+    return wants, stripped
 
 
 def strip_vote_line(text: str) -> str:
@@ -278,6 +331,11 @@ class Game:
         self.rounds_survived: int | None = None
         self.end_reason: str | None = None
         self.votes: list[dict] = []           # per-vote summary for the logs
+        self.turns_completed = 0              # question turns fully played
+        self._vote_trigger: str | None = None # kind of the pending vote (state "vote")
+        self._vote_call_count: int | None = None   # how many asked, if players called it
+        self.eliminated_by: str | None = None
+        self.vote_requests: dict[str, dict[str, int]] = {}  # model -> {yes, no, missing}
 
         # What players have publicly seen
         self._intros: list[tuple[str, str]] = []
@@ -300,7 +358,7 @@ class Game:
         if self._state == "turn":
             return f"Round {self.round} · {self.players[self.turn - 1].name} asks"
         if self._state == "vote":
-            return f"Vote {self.vote_number + 1}"
+            return vote_label(self.vote_number + 1, self._vote_trigger or "scheduled")
         return ""
 
     def step(self) -> dict:
@@ -421,6 +479,14 @@ class Game:
             res, call_id = self._call(player, purpose + "_retry_empty", retry, round_no)
         return res, call_id
 
+    def _annotate_call(self, call_id: str, **fields) -> None:
+        """Add extra fields to an already-recorded call in the log."""
+        with self._lock:
+            for c in reversed(self.calls):
+                if c.get("call_id") == call_id:
+                    c.update(fields)
+                    return
+
     def _public_text(self, player: Player, raw: str, call_id: str, word_limit: int) -> tuple[str, str]:
         """(text shown to players, original text). Applies cleanup and the name rule."""
         original = (raw or "").strip()
@@ -503,19 +569,32 @@ class Game:
         limit = self.rules.answer_word_limit
         answers: list[tuple[str, str]] = []
 
+        calls_on = self.rules.player_vote_calls
+        wants: dict[str, bool | None] = {}
+
         def answer(p: Player, earlier: list[tuple[str, str]] | None):
             sequential = self.rules.answer_mode == "sequential"
-            task = prompts.answer_task(asker.name, question, p.name, limit, earlier, sequential)
+            task = prompts.answer_task(asker.name, question, p.name, limit, earlier, sequential, calls_on)
             res, call_id = self._call_text(p, "answer", task, r)
-            text, original = self._public_text(p, res.content, call_id, limit)
-            return text, original, res, call_id
+            wants_vote, content = None, res.content
+            if calls_on:
+                wants_vote, content = parse_vote_call(res.content)
+                self._annotate_call(call_id, wants_vote=wants_vote, vote_call_note=None if wants_vote is not None
+                                    else "no readable 'CALL VOTE: YES/NO' line; counted as NO")
+            text, _ = self._public_text(p, content, call_id, limit)
+            return text, (res.content or "").strip(), res, call_id, wants_vote
 
         def show(p: Player, result) -> None:
-            text, original, res, call_id = result
+            text, original, res, call_id, wants_vote = result
+            extra = {"wants_vote": wants_vote} if calls_on else {}
             self._emit("message", player=p.name, kind="answer", round=r, turn=t, question_id=qid,
                        asker=asker.name, text=text, original_text=original, reasoning=res.reasoning,
-                       call_id=call_id)
+                       call_id=call_id, **extra)
             answers.append((p.name, text))
+            wants[p.name] = wants_vote
+            if calls_on:
+                rec = self.vote_requests.setdefault(p.model, {"yes": 0, "no": 0, "missing": 0})
+                rec["yes" if wants_vote else "no" if wants_vote is False else "missing"] += 1
 
         if self.rules.answer_mode == "sequential":
             for p in order:
@@ -528,23 +607,36 @@ class Game:
             for p in order:
                 show(p, results[p.name])
 
+        # 3. Did the players call a vote?
+        requesters = [p.name for p in self.players if wants.get(p.name)]
+        called = vote_call_triggered(requesters, self.rules)
+        if calls_on:
+            self._emit("vote_call_check", round=r, turn=t, requesters=requesters, count=len(requesters),
+                       threshold=self.rules.vote_call_threshold, triggered=called)
+        show_requests = calls_on and self.rules.reveal_vote_calls
         self._entries.append({"kind": "turn", "round": r, "turn": t, "asker": asker.name,
-                              "question": question, "answers": answers})
+                              "question": question, "answers": answers,
+                              "requesters": requesters if show_requests else None})
+        self.turns_completed += 1
 
-        # 3. Advance
+        # 4. Advance
         self.turn += 1
-        if self.turn <= len(self.players):
-            return False
-        self.rounds_completed = r
-        self.round += 1
-        self.turn = 1
-        self._set_state("vote" if vote_due(self.rounds_completed, self.rules) else "turn")
-        return True
+        end_of_round = self.turn > len(self.players)
+        if end_of_round:
+            self.rounds_completed = r
+            self.round += 1
+            self.turn = 1
+        trigger = vote_trigger(called, end_of_round and vote_due(self.rounds_completed, self.rules))
+        if trigger:
+            self._vote_trigger = trigger
+            self._vote_call_count = len(requesters) if called else None
+            self._set_state("vote")
+        return end_of_round or trigger is not None
 
-    def _cast_vote(self, p: Player, number: int) -> dict:
+    def _cast_vote(self, p: Player, number: int, note: str = "") -> dict:
         valid_names = [x.name for x in self.players if x is not p]
         threshold = self.rules.vote_threshold
-        messages = self._messages(p, prompts.vote_task(number, p.name, valid_names, threshold))
+        messages = self._messages(p, prompts.vote_task(number, p.name, valid_names, threshold, note))
         res, call_id = self._call(p, "vote", messages, self.rounds_completed)
         target, problem = parse_vote(res.content, p.name, self.rules.player_names)
         first_problem = problem
@@ -561,10 +653,16 @@ class Game:
     def _do_vote(self) -> None:
         self.vote_number += 1
         n = self.vote_number
-        self._emit("phase", phase="vote", round=self.rounds_completed, label=f"Vote {n}")
+        trigger = self._vote_trigger or "scheduled"
+        call_count = self._vote_call_count
+        self._emit("phase", phase="vote", round=self.rounds_completed, label=vote_label(n, trigger), trigger=trigger)
+        note = ""
+        if self.rules.player_vote_calls:
+            continues = decide_after_vote(None, self.rounds_completed, self.rules, trigger) == "continue"
+            note = prompts.vote_trigger_note(trigger, call_count, continues)
         for p in self.players:
             self._emit("thinking", player=p.name, action="vote", round=self.rounds_completed)
-        results = self._parallel(lambda p: self._cast_vote(p, n), self.players)
+        results = self._parallel(lambda p: self._cast_vote(p, n, note), self.players)
 
         ballots: dict[str, str | None] = {}
         for p in self.players:
@@ -577,30 +675,36 @@ class Game:
 
         outcome = resolve_vote(ballots, self.cfg)
         elim_role = self.by_name[outcome.eliminated].role if outcome.eliminated else None
-        decision = decide_after_vote(elim_role, self.rounds_completed, self.rules)
+        decision = decide_after_vote(elim_role, self.rounds_completed, self.rules, trigger)
         self._emit("vote_result", vote_number=n, tally=outcome.tally, ballots=ballots,
                    eliminated=outcome.eliminated, eliminated_role=elim_role, decision=decision,
-                   rounds_completed=self.rounds_completed)
+                   rounds_completed=self.rounds_completed, trigger=trigger, call_count=call_count,
+                   turns_completed=self.turns_completed)
 
         trio_names = {p.name for p in self.players if p.role == "trio"}
         self.votes.append({
             "vote_number": n, "rounds_completed": self.rounds_completed, "tally": outcome.tally,
             "ballots": ballots, "eliminated": outcome.eliminated, "eliminated_role": elim_role,
-            "decision": decision,
+            "decision": decision, "trigger": trigger, "call_count": call_count,
+            "turns_completed": self.turns_completed,
             "imposter_votes_from_trio": sum(1 for v, t in ballots.items()
                                             if v in trio_names and t == self.imposter.name),
             "trio_valid_ballots": sum(1 for v, t in ballots.items() if v in trio_names and t is not None),
         })
         self._entries.append({
             "kind": "vote", "vote_number": n, "tally": outcome.tally,
+            "called_count": call_count if "called" in trigger else None, "num_players": len(self.players),
             "ballots": ballots if self.rules.reveal_votes else None,
             "result_text": prompts.vote_result_text(outcome.eliminated, outcome.tally,
                                                     self.rules.vote_threshold, decision == "continue"),
         })
 
+        self._vote_trigger, self._vote_call_count = None, None
         if decision == "continue":
             self._set_state("turn")
             return
+        if outcome.eliminated:
+            self.eliminated_by = trigger
         winner = {"trio_win": "trio", "imposter_win": "imposter"}.get(decision)
         self._finish(decision, winner=winner, eliminated=outcome.eliminated, eliminated_role=elim_role,
                      rounds_survived=self.rounds_completed if outcome.eliminated else None)
@@ -628,8 +732,10 @@ class Game:
             self.end_reason = reason
             self.finished_at = _now_iso()
             self._emit("game_over", outcome=outcome, winner=winner, eliminated=eliminated,
-                       eliminated_role=eliminated_role, rounds_survived=rounds_survived,
-                       rounds_completed=self.rounds_completed, total_cost_usd=round(self.total_cost_usd, 8),
+                       eliminated_role=eliminated_role, eliminated_by=self.eliminated_by,
+                       rounds_survived=rounds_survived,
+                       rounds_completed=self.rounds_completed, turns_completed=self.turns_completed,
+                       total_cost_usd=round(self.total_cost_usd, 8),
                        total_input_tokens=self.total_input_tokens, total_output_tokens=self.total_output_tokens,
                        num_api_calls=len(self.calls),
                        log_file=str(self.logger.json_path) if self._started else None,
@@ -661,10 +767,12 @@ class Game:
                 "seat_order": [p.name for p in self.players],
                 "system_prompts": {p.name: p.system_prompt for p in self.players},
                 "state": {"state": self._state, "round": self.round, "turn": self.turn,
-                          "rounds_completed": self.rounds_completed, "vote_number": self.vote_number},
+                          "rounds_completed": self.rounds_completed, "vote_number": self.vote_number,
+                          "turns_completed": self.turns_completed, "pending_vote_trigger": self._vote_trigger},
                 "outcome": {"outcome": self.outcome, "winner": self.winner, "eliminated": self.eliminated,
                             "eliminated_role": self.eliminated_role, "rounds_survived": self.rounds_survived,
-                            "rounds_completed": self.rounds_completed, "reason": self.end_reason},
+                            "rounds_completed": self.rounds_completed, "turns_completed": self.turns_completed,
+                            "eliminated_by": self.eliminated_by, "reason": self.end_reason},
                 "votes": list(self.votes),
                 "totals": self._totals(),
                 "calls": list(self.calls),
@@ -700,8 +808,17 @@ class Game:
             "eliminated_model": elim_model, "rounds_survived": self.rounds_survived,
             "imposter_rounds_survived": imposter_rounds,
             "rounds_completed": self.rounds_completed,
+            "turns_completed": self.turns_completed,
+            "player_vote_calls": self.rules.player_vote_calls,
+            "vote_call_threshold": self.rules.vote_call_threshold,
+            "called_votes": sum(1 for v in self.votes if "called" in v["trigger"]),
+            "scheduled_votes": sum(1 for v in self.votes if "scheduled" in v["trigger"]),
+            "eliminated_by": self.eliminated_by,
+            "vote_requests_by_model": {m: dict(c) for m, c in self.vote_requests.items()},
             "votes": [{"vote_number": v["vote_number"], "rounds_completed": v["rounds_completed"],
-                       "tally": v["tally"], "ballots": v["ballots"], "eliminated": v["eliminated"]}
+                       "turns_completed": v["turns_completed"], "trigger": v["trigger"],
+                       "call_count": v["call_count"], "tally": v["tally"], "ballots": v["ballots"],
+                       "eliminated": v["eliminated"]}
                       for v in self.votes],
             "imposter_votes_received_by_trio": [v["imposter_votes_from_trio"] for v in self.votes],
             "trio_valid_ballots": [v["trio_valid_ballots"] for v in self.votes],

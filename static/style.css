@@ -317,3 +317,18 @@ details > summary:hover { color: var(--text); }
   background: var(--accent); color: var(--accent-text); border-color: var(--accent);
   box-shadow: 0 4px 14px rgba(0, 0, 0, .2); border-radius: 999px;
 }
+
+/* ---------- player-called votes ---------- */
+.chip-called { background: var(--warn-bg); color: var(--warn); }
+.chip-scheduled { background: var(--neutral-bg); color: var(--muted); }
+body.detective:not(.game-over) .spoiler-inline { display: none; }
+.vote-call { padding: 4px 4px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px; }
+.vote-call.none { opacity: .75; }
+.vote-call.triggered {
+  padding: 8px 12px; border-radius: 8px; font-size: 13.5px;
+  background: var(--warn-bg); color: var(--text); border: 1px solid var(--warn);
+}
+.vote-call.triggered strong { color: var(--warn); margin-right: 4px; }
+.phase-called { color: var(--warn); }
+.vote-block.called { border-top-color: var(--warn); }
+.vote-block h3 { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
