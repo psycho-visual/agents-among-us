@@ -15,3 +15,6 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# Backup written when settings are saved from the browser
+config.toml.bak

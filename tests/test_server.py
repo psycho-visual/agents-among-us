@@ -587,5 +587,186 @@ class NoImposterTests(unittest.TestCase):
         self.assertTrue(c.stats()["ok"])
 
 
+def _engine_has_settings_api() -> bool:
+    try:
+        from imposter_game import config
+        return all(callable(getattr(config, n, None))
+                   for n in ("settings_schema", "read_settings", "validate_settings", "save_settings"))
+    except Exception:
+        return False
+
+
+FAKE_MODELS = {"data": [
+    {"id": "openai/gpt-6-luna", "name": "OpenAI: GPT-6 Luna", "context_length": 1050000,
+     "architecture": {"output_modalities": ["text"]},
+     "pricing": {"prompt": "0.0000001", "completion": "0.0000005"},
+     "reasoning": {"supported_efforts": ["max", "high", "low", "none"], "default_effort": "medium"}},
+    {"id": "acme/painter", "name": "Acme: Painter", "architecture": {"output_modalities": ["image"]},
+     "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+    {"id": "anthropic/claude-haiku-5.5", "name": "Anthropic: Claude Haiku 5.5", "context_length": 1000000,
+     "pricing": {"prompt": "0.0000001", "completion": "0.0000005"}},
+    {"id": "openrouter/auto", "name": "Auto Router", "pricing": {"prompt": "-1", "completion": "-1"}},
+]}
+
+
+@unittest.skipUnless(_engine_has_settings_api(), "engine has no settings API yet")
+class SettingsTests(unittest.TestCase):
+    """Settings endpoints against a temp COPY of config.toml; the real file and the network are never touched."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.real_config_bytes = CONFIG.read_bytes()
+        cls.real_bak_existed = (ROOT / "config.toml.bak").exists()
+        cls.tmp = Path(tempfile.mkdtemp(prefix="aau-test-settings-"))
+        cls.cfg_path = cls.tmp / "config.toml"
+        cls.fetch_calls = 0
+
+        def fake_fetcher():
+            cls.fetch_calls += 1
+            return FAKE_MODELS
+
+        shutil.copy(CONFIG, cls.cfg_path)
+        cls.controller = GameController(cls.cfg_path, mock=True, log_dir=cls.tmp / "logs", mock_options={"delay": 0},
+                                        seed=11, keepalive_seconds=1.0, prompts_dir=cls.tmp / "prompts",
+                                        models_fetcher=fake_fetcher)
+        cls.server = make_server(cls.controller, "127.0.0.1", 0)
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        threading.Thread(target=cls.server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.controller.wait_idle(30)
+        cls.server.close_all()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def tearDown(self):
+        self.controller.pause()
+        self.controller.wait_idle(30)
+        # Never touch the real config.toml (or leave a backup next to it).
+        self.assertEqual(CONFIG.read_bytes(), self.real_config_bytes)
+        self.assertEqual((ROOT / "config.toml.bak").exists(), self.real_bak_existed)
+
+    get = ServerTestBase.get
+    get_json = ServerTestBase.get_json
+    post = ServerTestBase.post
+
+    def settings(self) -> dict:
+        status, data = self.get_json("/api/settings")
+        self.assertEqual(status, 200, data)
+        return data
+
+    def test_get_settings(self):
+        data = self.settings()
+        self.assertTrue(data["ok"])
+        ids = {f["id"] for f in data["schema"]}
+        self.assertIn("rules.vote_threshold", ids)
+        self.assertIn("trio.model", ids)
+        self.assertEqual(set(data["values"]) >= {"rules.vote_threshold", "trio.model"}, True)
+        self.assertEqual(Path(data["config_path"]), self.cfg_path.resolve())
+        self.assertFalse(data["running"])
+        self.assertIn("New game", data["note"])
+        self.assertNotIn("api_key", json.dumps(data))
+
+    def test_validate(self):
+        values = self.settings()["values"]
+        status, res = self.post("/api/settings/validate", body={"values": values})
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["errors"], {})
+        bad = dict(values, **{"rules.vote_threshold": 9})
+        status, res = self.post("/api/settings/validate", body={"values": bad})
+        self.assertIn("rules.vote_threshold", res["errors"])
+        status, res = self.post("/api/settings/validate", body={"values": "nope"})
+        self.assertEqual(status, 400)
+
+    def test_save_round_trip_and_invalid_save(self):
+        values = self.settings()["values"]
+        before = self.cfg_path.read_bytes()
+        # Invalid: nothing written.
+        status, res = self.post("/api/settings/save", body={"values": dict(values, **{"rules.vote_threshold": 0})})
+        self.assertFalse(res["ok"])
+        self.assertIn("rules.vote_threshold", res["errors"])
+        self.assertEqual(self.cfg_path.read_bytes(), before)
+        # Valid: only that value changes, comments survive, a backup is made.
+        new_limit = values["rules.answer_word_limit"] + 7
+        status, res = self.post("/api/settings/save", body={"values": dict(values, **{"rules.answer_word_limit": new_limit})})
+        self.assertEqual(status, 200, res)
+        self.assertTrue(res["ok"], res)
+        self.assertIn("Saved", res["message"])
+        text = self.cfg_path.read_text(encoding="utf-8")
+        self.assertIn(f"answer_word_limit = {new_limit}", text)
+        self.assertEqual(text.count("#"), before.decode("utf-8").count("#"))
+        if res.get("backup"):
+            self.assertTrue(str(res["backup"]).startswith(str(self.tmp)))
+        self.assertEqual(self.settings()["values"]["rules.answer_word_limit"], new_limit)
+        # Put it back.
+        status, res = self.post("/api/settings/save", body={"values": values})
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.cfg_path.read_bytes(), before)
+
+    def test_save_and_start_new_game(self):
+        values = self.settings()["values"]
+        new_q = values["rules.question_word_limit"] + 3
+        status, res = self.post("/api/settings/save",
+                                body={"values": dict(values, **{"rules.question_word_limit": new_q}), "start_new_game": True})
+        self.assertEqual(status, 200, res)
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["new_game"]["ok"], res)
+        self.assertTrue(res["status"]["has_game"])
+        self.assertEqual(self.controller.cfg.rules.question_word_limit, new_q)
+        # While a game is running, save works but no new game is started.
+        self.controller.mock_options = {"delay": 0.05}
+        try:
+            self.assertEqual(self.post("/api/run_all")[0], 200)
+            status, res = self.post("/api/settings/save", body={"values": values, "start_new_game": True})
+            self.assertTrue(res["ok"], res)
+            self.assertFalse(res["new_game"]["ok"])
+            self.assertIn("running", res["new_game"]["message"])
+        finally:
+            self.controller.pause()
+            self.controller.wait_idle(30)
+            self.controller.mock_options = {"delay": 0}
+
+    def test_origin_protection(self):
+        values = self.settings()["values"]
+        before = self.cfg_path.read_bytes()
+        for path in ("/api/settings/save", "/api/settings/validate"):
+            status, _ = self.post(path, headers={"Origin": "http://evil.example"},
+                                  body={"values": dict(values, **{"rules.answer_word_limit": 77})})
+            self.assertEqual(status, 403, path)
+        status, _, _ = self.get("/api/settings", headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.cfg_path.read_bytes(), before)
+
+    def test_models_with_fake_fetcher_and_cache(self):
+        self.controller._models_cache = None
+        type(self).fetch_calls = 0
+        status, res = self.get_json("/api/models")
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"])
+        ids = [m["id"] for m in res["models"]]
+        self.assertNotIn("acme/painter", ids)           # image-only models are left out
+        luna = next(m for m in res["models"] if m["id"] == "openai/gpt-6-luna")
+        self.assertAlmostEqual(luna["prompt_per_m"], 0.1)
+        self.assertAlmostEqual(luna["completion_per_m"], 0.5)
+        self.assertEqual(luna["supported_efforts"], ["max", "high", "low", "none"])
+        self.assertEqual(luna["default_effort"], "medium")
+        self.assertEqual(luna["context_length"], 1050000)
+        auto = next(m for m in res["models"] if m["id"] == "openrouter/auto")
+        self.assertIsNone(auto["prompt_per_m"])          # negative "variable" prices -> unknown
+        haiku = next(m for m in res["models"] if m["id"] == "anthropic/claude-haiku-5.5")
+        self.assertIsNone(haiku["supported_efforts"])
+        self.get_json("/api/models")
+        self.assertEqual(self.fetch_calls, 1)            # cached
+
+    def test_models_offline(self):
+        def boom():
+            raise OSError("network is unreachable")
+        c = GameController(self.cfg_path, mock=True, log_dir=self.tmp / "logs", models_fetcher=boom)
+        res = c.models()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["models"], [])
+        self.assertIn("unreachable", res["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

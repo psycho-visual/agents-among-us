@@ -14,6 +14,7 @@ starting a real (non-mock) game to get a friendly error when it is missing.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -42,7 +43,22 @@ DEFAULT_BANNED_NAMES = [
 
 
 class ConfigError(Exception):
-    """A problem with config.toml or the API key, explained for a human."""
+    """A problem with config.toml or the API key, explained for a human.
+
+    `field` is the setting id it is about (e.g. "rules.vote_threshold") when known,
+    and `short` is the message without the "config.toml: [rules]" prefix.
+    """
+
+    def __init__(self, message: str, field: str | None = None):
+        super().__init__(message)
+        m = re.search(r"\[(\w+)\] section", message) or re.search(r"\[(\w+)\] (\w+)", message)
+        if field is None and m:
+            field = f"{m.group(1)}.model" if m.re.pattern.endswith("section") else f"{m.group(1)}.{m.group(2)}"
+        self.field = field
+        if m and m.re.pattern.endswith("section"):
+            self.short = re.sub(r"^[^:]*: ", "", message, count=1)
+        else:
+            self.short = re.sub(r"^.*?\[\w+\] ", "", message, count=1) if m else message
 
 
 @dataclass
@@ -347,3 +363,421 @@ def load_config(path: str | Path | None = None, *, read_key: bool = True) -> Gam
     cfg = config_from_dict(data, file=path.name, api_key=find_api_key() if read_key else None)
     cfg.source_path = str(path)
     return cfg
+
+
+# =============================================================================
+# Settings (used by the GUI settings drawer)
+# =============================================================================
+#
+# settings_schema()            describes every option (label, help, type, limits, default, group)
+# read_settings(path)          current values from config.toml, defaults filled in
+# validate_settings(values)    same checks as load_config, reported per setting id
+# save_settings(path, values)  writes the values back into config.toml, keeping all comments
+#
+# A setting id is "<section>.<key>", e.g. "rules.vote_threshold".
+
+_EFFORT_CHOICES = [{"value": "", "label": "Model default"}] + [
+    {"value": e, "label": e} for e in REASONING_EFFORTS]
+
+# Factory defaults for the two model sections (the shipped config.toml); every other
+# default comes from the dataclasses above, i.e. what load_config uses when a key is missing.
+_MODEL_DEFAULTS = {
+    "trio": {"model": "anthropic/claude-haiku-5.5", "display_name": "Claude Haiku 5.5",
+             "reasoning_effort": "high", "max_output_tokens": 16000},
+    "imposter": {"model": "openai/gpt-6-luna", "display_name": "GPT-6 Luna",
+                 "reasoning_effort": "max", "max_output_tokens": 32000},
+}
+
+
+def _s(id, group, label, help, type, default, *, choices=None, min=None, max=None, step=None,
+       advanced=False, visible_if=None, nullable=False) -> dict:
+    section, key = id.split(".", 1)
+    return {"id": id, "section": section, "key": key, "group": group, "label": label, "help": help,
+            "type": type, "choices": choices, "min": min, "max": max, "step": step, "default": default,
+            "advanced": advanced, "visible_if": visible_if, "nullable": nullable}
+
+
+def _model_schema(role: str) -> list[dict]:
+    d = _MODEL_DEFAULTS[role]
+    who = "three trio players (all copies of one model)" if role == "trio" else "single imposter"
+    return [
+        _s(f"{role}.model", "Players & models", f"{role.capitalize()} model",
+           f"The OpenRouter model id used by the {who}, e.g. \"{d['model']}\".", "model", d["model"]),
+        _s(f"{role}.display_name", "Players & models", f"{role.capitalize()} display name",
+           "The model name the players are told (\"You are ...\"). Leave empty to use the model id.",
+           "string", d["display_name"]),
+        _s(f"{role}.reasoning_effort", "Players & models", f"{role.capitalize()} reasoning effort",
+           "How hard the model thinks before replying. \"Model default\" sends nothing.",
+           "enum", d["reasoning_effort"], choices=_EFFORT_CHOICES),
+        _s(f"{role}.max_output_tokens", "Players & models", f"{role.capitalize()} max output tokens",
+           "Token budget per reply, including hidden reasoning. Empty = use the API default below.",
+           "int", d["max_output_tokens"], min=16, max=200000, step=1000, nullable=True, advanced=True),
+    ]
+
+
+def settings_schema() -> list[dict]:
+    """One entry per editable option, in display order (see module comment above)."""
+    r, p, a = RulesConfig(), ParaphraseConfig(), ApiConfig()
+    calls_on = {"id": "rules.player_vote_calls", "equals": True}
+    para_on = {"id": "paraphrase.enabled", "equals": True}
+    return [
+        *_model_schema("trio"),
+        *_model_schema("imposter"),
+        # --- Game flow
+        _s("rules.rounds_before_vote", "Game flow", "Rounds between votes",
+           "A vote is held automatically after every this many rounds. In one round every player asks one "
+           "question and everybody answers it.", "int", r.rounds_before_vote, min=1, max=20, step=1),
+        _s("rules.on_no_decision", "Game flow", "When a vote removes nobody",
+           "End the game with no winner, or keep playing and vote again later (up to the max rounds).",
+           "enum", r.on_no_decision, choices=[{"value": "end", "label": "End the game (no winner)"},
+                                              {"value": "continue", "label": "Keep playing"}]),
+        _s("rules.max_rounds", "Game flow", "Max rounds",
+           "With \"Keep playing\": the game stops after this many rounds (a final vote is held then).",
+           "int", r.max_rounds, min=1, max=50, step=1,
+           visible_if={"id": "rules.on_no_decision", "equals": "continue"}),
+        _s("rules.answer_mode", "Game flow", "How players answer",
+           "Simultaneous: everyone answers blind at the same time. Sequential: one after another, each "
+           "seeing the earlier answers.", "enum", r.answer_mode,
+           choices=[{"value": "simultaneous", "label": "Simultaneous (blind)"},
+                    {"value": "sequential", "label": "Sequential (see earlier answers)"}]),
+        _s("rules.player_names", "Game flow", "Seat names",
+           "The four neutral names players are known by, in seat order.", "string_list", list(r.player_names),
+           advanced=True),
+        _s("rules.shuffle_seats", "Game flow", "Random imposter seat",
+           "On: the imposter sits in a random seat each game. Off: it always takes the last seat.",
+           "bool", r.shuffle_seats),
+        # --- Voting
+        _s("rules.vote_threshold", "Voting", "Votes needed to eliminate",
+           "How many of the 4 votes a player needs to be voted out. Nobody may vote for themselves.",
+           "int", r.vote_threshold, min=1, max=4, step=1),
+        _s("rules.reveal_votes", "Voting", "Reveal who voted for whom",
+           "After each vote, show everybody the individual ballots.", "bool", r.reveal_votes),
+        _s("rules.player_vote_calls", "Voting", "Players can call a vote",
+           "After each answer, players may secretly ask for a vote; if enough ask in the same turn, a vote "
+           "is held at once. A called vote that removes nobody never ends the game.", "bool",
+           r.player_vote_calls),
+        _s("rules.vote_call_threshold", "Voting", "Requests needed to call a vote",
+           "How many players must ask for a vote after the same question.", "int", r.vote_call_threshold,
+           min=1, max=4, step=1, visible_if=calls_on),
+        _s("rules.reveal_vote_calls", "Voting", "Show who asked for a vote",
+           "On: after each question everyone sees who asked for a vote. Off: requests stay secret.",
+           "bool", r.reveal_vote_calls, visible_if=calls_on),
+        # --- Fairness
+        _s("rules.name_rule", "Fairness", "Talking about model names",
+           "Lying allowed: players may claim to be any model. No names: nobody may mention any model or AI "
+           "company name in public.", "enum", r.name_rule,
+           choices=[{"value": "lie_allowed", "label": "Allowed (lying is fine)"},
+                    {"value": "no_names", "label": "Forbidden (no model names)"}]),
+        _s("rules.redact_violations", "Fairness", "Hide forbidden names",
+           "Replace a forbidden name with [REDACTED] before the other players see it. The log keeps the "
+           "original.", "bool", r.redact_violations, visible_if={"id": "rules.name_rule", "equals": "no_names"}),
+        _s("rules.banned_names", "Fairness", "Forbidden words",
+           "Words that count as a model/company name (whole words, any case). Both models' names and ids are "
+           "always added.", "string_list", list(r.banned_names), advanced=True,
+           visible_if={"id": "rules.name_rule", "equals": "no_names"}),
+        _s("rules.imposter_knows_own_model", "Fairness", "Tell the imposter its own model",
+           "On: the imposter is told which model it is. Off: it only knows it is the imposter.", "bool",
+           r.imposter_knows_own_model),
+        _s("rules.normalize_typography", "Fairness", "Tidy typography",
+           "Straighten curly quotes, replace long dashes, strip markdown in everything players say, so "
+           "punctuation habits don't give a model away.", "bool", r.normalize_typography),
+        _s("rules.no_imposter_chance", "Fairness", "Chance of no imposter",
+           "Probability (0 to 1) that a game has no imposter at all. When above 0, players are told and may "
+           "vote for NOBODY.", "float", r.no_imposter_chance, min=0.0, max=1.0, step=0.05),
+        # --- Text limits
+        _s("rules.intro_word_limit", "Text limits", "Introduction word limit",
+           "Soft limit given to players. Text over twice the limit is cut off.", "int", r.intro_word_limit,
+           min=5, max=1000, step=5),
+        _s("rules.question_word_limit", "Text limits", "Question word limit",
+           "Soft limit given to players. Text over twice the limit is cut off.", "int", r.question_word_limit,
+           min=5, max=1000, step=5),
+        _s("rules.answer_word_limit", "Text limits", "Answer word limit",
+           "Soft limit given to players. Text over twice the limit is cut off.", "int", r.answer_word_limit,
+           min=5, max=1000, step=5),
+        # --- Paraphrase
+        _s("paraphrase.enabled", "Paraphrase", "Paraphrase everything players say",
+           "A neutral third model rewrites every public message in a plain style, so players must judge what "
+           "is said, not how. Adds a small API cost.", "bool", p.enabled),
+        _s("paraphrase.model", "Paraphrase", "Paraphrase model",
+           "A cheap, non-reasoning model from a different company than both players.", "model", p.model,
+           visible_if=para_on),
+        _s("paraphrase.reasoning_effort", "Paraphrase", "Paraphrase reasoning effort",
+           "Usually \"Model default\" (a non-reasoning model needs none).", "enum", "", choices=_EFFORT_CHOICES,
+           visible_if=para_on, advanced=True),
+        _s("paraphrase.max_output_tokens", "Paraphrase", "Paraphrase max output tokens",
+           "Token budget per rewritten message.", "int", p.max_output_tokens, min=16, max=200000, step=100,
+           visible_if=para_on, advanced=True),
+        # --- API
+        _s("api.max_output_tokens", "API", "Default max output tokens",
+           "Token budget per reply (including hidden reasoning) for roles without their own setting. Empty "
+           "replies that ran out are retried once with double.", "int", a.max_output_tokens, min=16,
+           max=200000, step=1000, advanced=True),
+        _s("api.timeout_seconds", "API", "Timeout (seconds)",
+           "How long to wait for one reply before giving up. Reasoning models can be slow.", "float",
+           float(a.timeout_seconds), min=1.0, max=3600.0, step=10.0, advanced=True),
+        _s("api.max_retries", "API", "Retries",
+           "How many times to retry after a network error, rate limit or server error.", "int", a.max_retries,
+           min=0, max=10, step=1, advanced=True),
+        _s("api.temperature", "API", "Temperature",
+           "Sampling temperature. Leave empty to not send one (recommended: several reasoning models reject it).",
+           "float", None, min=0.0, max=2.0, step=0.1, nullable=True, advanced=True),
+        _s("api.prompt_caching", "API", "Prompt caching",
+           "Let providers cache the repeated start of each prompt (cheaper and faster).", "bool",
+           a.prompt_caching, advanced=True),
+        _s("api.base_url", "API", "API base URL",
+           "The OpenRouter API address. Only change this if you know you need to.", "string", a.base_url,
+           advanced=True),
+    ]
+
+
+def _schema_by_id() -> dict[str, dict]:
+    return {e["id"]: e for e in settings_schema()}
+
+
+def _value_from_toml(entry: dict, raw):
+    """A value as found in the TOML file -> the settings representation."""
+    if entry["id"] == "api.temperature" and raw == "":
+        return None
+    if entry["type"] == "enum" and entry["choices"] and entry["choices"][0]["value"] == "" and isinstance(raw, str):
+        return raw.strip().lower()
+    if entry["type"] == "float" and isinstance(raw, int) and not isinstance(raw, bool):
+        return float(raw)
+    return raw
+
+
+def _missing_value(entry: dict):
+    """The value load_config effectively uses when this key is absent from config.toml."""
+    if entry["section"] in _MODEL_DEFAULTS:
+        return None if entry["nullable"] else ""
+    return entry["default"]
+
+
+def read_settings(path: str | Path | None = None) -> dict:
+    """{"values": {id: value}, "errors": [str]} — what config.toml says, defaults filled in."""
+    path = Path(path) if path else DEFAULT_CONFIG_PATH
+    errors: list[str] = []
+    data: dict = {}
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        errors.append(f"Config file not found: {path}")
+    except tomllib.TOMLDecodeError as e:
+        errors.append(f"{path.name} is not valid TOML: {e}")
+    values = {}
+    for entry in settings_schema():
+        table = data.get(entry["section"])
+        if isinstance(table, dict) and entry["key"] in table:
+            values[entry["id"]] = _value_from_toml(entry, table[entry["key"]])
+        else:
+            values[entry["id"]] = _missing_value(entry)
+    if data:
+        try:
+            config_from_dict(data, file=path.name)
+        except ConfigError as e:
+            errors.append(str(e))
+    return {"values": values, "errors": errors}
+
+
+def _coerce(entry: dict, value):
+    """Turn a value from the GUI (JSON) into the right Python type, or raise ValueError."""
+    t = entry["type"]
+    if entry["nullable"] and (value is None or value == ""):
+        return None
+    if t == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        raise ValueError("must be on or off")
+    if t == "int":
+        if isinstance(value, bool):
+            raise ValueError("must be a whole number")
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and re.fullmatch(r"\s*-?\d+\s*", value):
+            return int(value)
+        raise ValueError("must be a whole number")
+    if t == "float":
+        if isinstance(value, bool):
+            raise ValueError("must be a number")
+        if isinstance(value, (int, float)):
+            f = float(value)
+        elif isinstance(value, str):
+            try:
+                f = float(value)
+            except ValueError:
+                raise ValueError("must be a number") from None
+        else:
+            raise ValueError("must be a number")
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError("must be a normal number")
+        return f
+    if t == "string_list":
+        if isinstance(value, str):
+            value = [x for x in re.split(r"[,\n]", value)]
+        if not isinstance(value, (list, tuple)) or not all(isinstance(x, str) for x in value):
+            raise ValueError("must be a list of words")
+        return [x.strip() for x in value if x.strip()]
+    if not isinstance(value, str):
+        raise ValueError("must be text")
+    if t == "enum":
+        value = value.strip()
+        if value not in [c["value"] for c in entry["choices"]]:
+            raise ValueError("must be one of: " + ", ".join(c["value"] or '""' for c in entry["choices"]))
+    return value
+
+
+def _to_toml_value(entry: dict, value):
+    """The settings value as it should be written into config.toml (None = remove the key)."""
+    if value is None:
+        return "" if entry["id"] == "api.temperature" else None
+    return value
+
+
+def _build_data(values: dict) -> dict:
+    data: dict = {}
+    for entry in settings_schema():
+        v = _to_toml_value(entry, values.get(entry["id"]))
+        if v is not None:
+            data.setdefault(entry["section"], {})[entry["key"]] = v
+    return data
+
+
+def _company(model_id: str) -> str:
+    return model_id.split("/", 1)[0].lower() if "/" in model_id else ""
+
+
+def _warnings(v: dict) -> dict[str, str]:
+    w: dict[str, str] = {}
+    if v.get("trio.model") and v.get("trio.model") == v.get("imposter.model"):
+        w["imposter.model"] = ("The trio and the imposter are the same model, so there is nothing to detect "
+                               "(fine as a control experiment).")
+    if v.get("paraphrase.enabled"):
+        pc = _company(v.get("paraphrase.model") or "")
+        if pc and pc in (_company(v.get("trio.model") or ""), _company(v.get("imposter.model") or "")):
+            w["paraphrase.model"] = ("The paraphrase model is from the same company as one of the players, "
+                                     "which could make that player's style easier to spot.")
+    for role in ("trio", "imposter"):
+        budget = v.get(f"{role}.max_output_tokens") or v.get("api.max_output_tokens") or 0
+        if v.get(f"{role}.reasoning_effort") in ("max", "xhigh") and budget < 16000:
+            w[f"{role}.max_output_tokens"] = (f"With reasoning effort \"{v.get(role + '.reasoning_effort')}\", "
+                                              f"{budget} tokens may run out before the reply is written; "
+                                              "16000 or more is safer.")
+    return w
+
+
+def validate_settings(values: dict, base: dict | None = None) -> dict:
+    """{"errors": {id: msg}, "warnings": {id: msg}} using the same checks as load_config.
+
+    Missing ids are taken from `base` (e.g. the current file) or the defaults.
+    """
+    schema = _schema_by_id()
+    merged = {i: e["default"] for i, e in schema.items()}
+    merged.update(base or {})
+    errors: dict[str, str] = {}
+    for k, v in (values or {}).items():
+        if k not in schema:
+            errors[k] = "Unknown setting."
+            continue
+        try:
+            merged[k] = _coerce(schema[k], v)
+        except ValueError as e:
+            errors[k] = f"{schema[k]['label']} {e}."
+    data = _build_data(merged)
+    for _ in range(len(schema) + 1):           # collect every error, not just the first
+        try:
+            config_from_dict(data, file="config.toml")
+            break
+        except ConfigError as e:
+            fid = e.field if e.field in schema else "_general"
+            if fid in errors:
+                errors.setdefault("_general", e.short)
+                break
+            errors[fid] = e.short
+            if fid == "_general":
+                break
+            sec, key = fid.split(".", 1)
+            data.setdefault(sec, {})[key] = _to_toml_value(schema[fid], schema[fid]["default"])
+            if data[sec][key] is None:
+                del data[sec][key]
+    return {"errors": errors, "warnings": _warnings(merged), "values": merged}
+
+
+def save_settings(path: str | Path | None, values: dict) -> dict:
+    """Validate and write values into config.toml in place (comments kept). See SETTINGS docs above."""
+    from . import toml_edit
+
+    path = Path(path) if path else DEFAULT_CONFIG_PATH
+    current = read_settings(path)
+    if any(e.startswith(("Config file not found", f"{path.name} is not valid TOML")) for e in current["errors"]):
+        return {"ok": False, "errors": {"_general": current["errors"][0]}, "warnings": {}, "backup": None,
+                "changed": []}
+    check = validate_settings(values, base=current["values"])
+    result = {"ok": False, "errors": check["errors"], "warnings": check["warnings"], "backup": None, "changed": []}
+    if check["errors"]:
+        return result
+
+    schema = _schema_by_id()
+    new_values = check["values"]
+    original = path.read_bytes().decode("utf-8")
+    try:
+        file_data = tomllib.loads(original)
+    except tomllib.TOMLDecodeError as e:
+        result["errors"] = {"_general": f"{path.name} is not valid TOML: {e}"}
+        return result
+    updates = {}
+    changed = []
+    for sid, entry in schema.items():
+        new = _to_toml_value(entry, new_values[sid])
+        table = file_data.get(entry["section"]) if isinstance(file_data.get(entry["section"]), dict) else {}
+        present = entry["key"] in table
+        if new is None:
+            if present:
+                updates[(entry["section"], entry["key"])] = toml_edit.REMOVE
+                changed.append(sid)
+            continue
+        if present and toml_edit._same(_value_from_toml(entry, table[entry["key"]]), new_values[sid]):
+            continue
+        if not present and toml_edit._same(_missing_value(entry), new_values[sid]):
+            continue          # absent from the file and still at the built-in default: leave it out
+        updates[(entry["section"], entry["key"])] = new
+        changed.append(sid)
+    result["changed"] = changed
+    if not updates:
+        result["ok"] = True
+        return result
+
+    new_text = toml_edit.set_values(original, updates)
+    backup = path.with_name(path.name + ".bak")
+    backup.write_bytes(original.encode("utf-8"))
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(new_text.encode("utf-8"))
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+    # Re-read to make sure the file is valid and says exactly what we meant.
+    problem = None
+    try:
+        reloaded = load_config(path, read_key=False)
+        after = read_settings(path)["values"]
+        wrong = [sid for sid in schema if not toml_edit._same(after[sid], new_values[sid])
+                 and not (after[sid] in (None, "") and new_values[sid] in (None, ""))]
+        if wrong:
+            problem = "Saving did not produce the expected values for: " + ", ".join(wrong)
+        del reloaded
+    except Exception as e:  # noqa: BLE001
+        problem = f"The saved file could not be read back ({e})"
+    if problem:
+        tmp.write_bytes(original.encode("utf-8"))      # put the previous file back (atomically)
+        os.replace(tmp, path)
+        result["errors"] = {"_general": problem + ". Your previous config.toml was restored."}
+        return result
+    result["ok"] = True
+    result["backup"] = str(backup)
+    return result

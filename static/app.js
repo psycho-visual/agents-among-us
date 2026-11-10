@@ -729,6 +729,7 @@
   function onStatus(st) {
     if (st.game_id && st.game_id !== S.gameId) resetGame(st.game_id);
     status = st;
+    try { document.dispatchEvent(new CustomEvent("aau:status", { detail: st })); } catch (_) { /* old browser */ }
     if (typeof st.mock === "boolean") S.mock = S.mock || st.mock;
     if (st.state !== "running" && st.state !== "pausing") clearAllThinking();
     if (st.config_error) banner("error", st.config_error, { id: "config-error", sticky: true, title: st.has_game ? "Couldn't start a new game:" : "Setup problem:" });

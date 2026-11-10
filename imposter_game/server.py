@@ -22,6 +22,10 @@ POST /api/prompts/validate {id, text} -> {errors, warnings}
 POST /api/prompts/save     {id, text} -> {ok, errors, warnings}   (writes prompts/<id>.txt)
 POST /api/prompts/reset    {id}       -> back to the default text  (deletes prompts/<id>.txt)
 Prompt edits apply to the next New game, never to a game in progress.
+GET  /api/settings            -> settings schema + current values of config.toml
+POST /api/settings/validate   {values} -> {errors: {id: msg}, warnings: {id: msg}}
+POST /api/settings/save       {values, start_new_game} -> writes config.toml (comments kept, backup made)
+GET  /api/models              -> OpenRouter's public model list (cached 1 hour), for the model picker
 """
 
 from __future__ import annotations
@@ -33,7 +37,9 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -139,6 +145,54 @@ def _load_engine() -> SimpleNamespace:
     )
 
 
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+MODELS_CACHE_SECONDS = 3600
+SETTINGS_NOTE = "Saved to config.toml. Applies when you click New game."
+
+
+def fetch_openrouter_models(timeout: float = 20.0) -> dict:
+    """Download OpenRouter's public model list (no API key needed)."""
+    req = urllib.request.Request(OPENROUTER_MODELS_URL, headers={
+        "Accept": "application/json", "User-Agent": "AgentsAmongUs/1.0", "X-Title": "Agents Among Us"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _per_million(price: Any) -> float | None:
+    try:
+        v = float(price)
+    except (TypeError, ValueError):
+        return None
+    return None if v < 0 else round(v * 1_000_000, 6)
+
+
+def reduce_models(payload: Any) -> list[dict]:
+    """OpenRouter /models response -> the short list the model picker needs."""
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    out = []
+    for m in data or []:
+        if not isinstance(m, dict) or not isinstance(m.get("id"), str):
+            continue
+        arch = m.get("architecture") if isinstance(m.get("architecture"), dict) else {}
+        outputs = arch.get("output_modalities")
+        if isinstance(outputs, list) and outputs and "text" not in outputs:
+            continue  # image/audio generators can't play
+        pricing = m.get("pricing") if isinstance(m.get("pricing"), dict) else {}
+        reasoning = m.get("reasoning") if isinstance(m.get("reasoning"), dict) else {}
+        efforts = reasoning.get("supported_efforts")
+        out.append({
+            "id": m["id"],
+            "name": str(m.get("name") or m["id"]),
+            "prompt_per_m": _per_million(pricing.get("prompt")),
+            "completion_per_m": _per_million(pricing.get("completion")),
+            "context_length": m.get("context_length") if isinstance(m.get("context_length"), int) else None,
+            "supported_efforts": [str(e) for e in efforts] if isinstance(efforts, list) else None,
+            "default_effort": reasoning.get("default_effort") if isinstance(reasoning.get("default_effort"), str) else None,
+        })
+    out.sort(key=lambda x: (x["name"].lower(), x["id"]))
+    return out
+
+
 class PromptError(Exception):
     """A prompt-editor request that can't be served; carries the HTTP status to use."""
 
@@ -160,6 +214,7 @@ class GameController:
         engine: Any = None,
         keepalive_seconds: float = 15.0,
         prompts_dir: str | os.PathLike | None = None,
+        models_fetcher: Callable[[], Any] | None = None,
     ):
         self.config_path = Path(config_path).resolve()
         self.mock = bool(mock)
@@ -169,6 +224,10 @@ class GameController:
         self.keepalive_seconds = keepalive_seconds
         # Where user prompt overrides live (None = the engine's default, prompts/ in the repo root).
         self.prompts_dir = Path(prompts_dir).resolve() if prompts_dir else None
+        # Model list for the settings picker; tests inject a fake fetcher (never the network).
+        self.models_fetcher = models_fetcher or fetch_openrouter_models
+        self._models_lock = threading.Lock()
+        self._models_cache: tuple[float, list[dict]] | None = None
         self._engine = engine
         self.engine_error: str | None = None
 
@@ -513,6 +572,87 @@ class GameController:
             for q in self._clients:
                 q.put(None)
 
+    # ------------------------------------------------------------------ settings (config.toml editor)
+    def _config_fn(self, name: str):
+        fn = getattr(getattr(self.engine, "config", None), name, None)
+        if not callable(fn):
+            raise PromptError("This version of the game engine has no settings editor.", 501)
+        return fn
+
+    @property
+    def running(self) -> bool:
+        return self.state in ("running", "pausing")
+
+    def settings_get(self) -> dict:
+        schema = self._config_fn("settings_schema")()
+        read = self._config_fn("read_settings")(self.config_path) or {}
+        return {
+            "ok": True,
+            "schema": schema,
+            "values": read.get("values") or {},
+            "errors": list(read.get("errors") or []),
+            "config_path": str(self.config_path),
+            "running": self.running,
+            "note": SETTINGS_NOTE,
+        }
+
+    @staticmethod
+    def _check_values(values: Any) -> dict:
+        if not isinstance(values, dict):
+            raise PromptError("'values' must be an object of {setting id: value}.", 400)
+        return values
+
+    def settings_validate(self, values: Any) -> dict:
+        res = self._config_fn("validate_settings")(self._check_values(values)) or {}
+        return {"ok": True, "errors": dict(res.get("errors") or {}), "warnings": dict(res.get("warnings") or {})}
+
+    def settings_save(self, values: Any, start_new_game: bool = False) -> dict:
+        values = self._check_values(values)
+        res = self._config_fn("save_settings")(self.config_path, values) or {}
+        out = {
+            "ok": bool(res.get("ok")),
+            "errors": dict(res.get("errors") or {}),
+            "warnings": dict(res.get("warnings") or {}),
+            "backup": res.get("backup"),
+            "changed": res.get("changed"),
+            "new_game": None,
+        }
+        if not out["ok"]:
+            out["message"] = res.get("message") or "Not saved: fix the errors first."
+            return out
+        out["message"] = "Saved to config.toml." + (f" Backup of the old file: {out['backup']}" if out["backup"] else "")
+        if start_new_game:
+            if self.running:
+                out["new_game"] = {"ok": False, "message": "A game is running, so no new game was started. "
+                                                            "Pause it, then click New game."}
+            else:
+                ok, msg = self.new_game()
+                out["new_game"] = {"ok": ok, "message": msg}
+        else:
+            with self._lock:
+                if not self.running:
+                    self.reload_config()  # refresh config errors (e.g. the API-key banner) right away
+            self.broadcast_status()
+        out["status"] = self.status()
+        return out
+
+    def models(self, force: bool = False) -> dict:
+        with self._models_lock:
+            cached = self._models_cache
+            if cached and not force and time.monotonic() - cached[0] < MODELS_CACHE_SECONDS:
+                return {"ok": True, "models": cached[1], "cached": True, "error": None}
+            try:
+                models = reduce_models(self.models_fetcher())
+            except Exception as exc:
+                if cached:  # stale is better than nothing
+                    return {"ok": True, "models": cached[1], "cached": True,
+                            "error": f"Could not refresh the model list ({exc}); showing an older copy."}
+                return {"ok": False, "models": [], "cached": False,
+                        "error": f"Could not download the model list from OpenRouter ({exc}). "
+                                 "You can still type a model id by hand."}
+            self._models_cache = (time.monotonic(), models)
+            return {"ok": True, "models": models, "cached": False, "error": None}
+
     # ------------------------------------------------------------------ prompt templates
     PROMPTS_NOTE = "Changes apply when you click New game. Each game records its prompt version."
 
@@ -713,6 +853,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json(self.controller.stats())
             if path == "/api/log":
                 return self._send_json(self.controller.log_info())
+            if path == "/api/settings":
+                return self._prompt_action(self.controller.settings_get)
+            if path == "/api/models":
+                return self._send_json(self.controller.models())
             if path == "/api/prompts":
                 return self._prompt_action(self.controller.prompts_list)
             if path == "/api/prompts/preview":
@@ -733,7 +877,7 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length > 0 else b""
         path = urlsplit(self.path).path
         c = self.controller
-        if path.startswith("/api/prompts/"):
+        if path.startswith("/api/prompts/") or path.startswith("/api/settings/"):
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -744,6 +888,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "/api/prompts/validate": lambda: c.prompts_validate(body.get("id"), body.get("text")),
                 "/api/prompts/save": lambda: c.prompts_save(body.get("id"), body.get("text")),
                 "/api/prompts/reset": lambda: c.prompts_reset(body.get("id")),
+                "/api/settings/validate": lambda: c.settings_validate(body.get("values")),
+                "/api/settings/save": lambda: c.settings_save(body.get("values"), bool(body.get("start_new_game"))),
             }
             action = prompt_actions.get(path)
             if action is None:
