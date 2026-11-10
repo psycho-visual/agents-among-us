@@ -90,7 +90,27 @@ In the browser:
 
 Expand **Reasoning** under any message to see what the model was thinking, if the API returned it.
 
-### 6. Look at the results
+### 6. Run many games in a row (batch mode)
+
+Click **Batch ▶▶** in the app, or use the terminal:
+
+```bash
+python3 batch.py --games 20 --budget 1.00 --alternate-roles
+```
+
+A batch keeps playing games until one of these happens:
+- it reaches the number of games,
+- another game would go over the spending limit,
+- your OpenRouter credit drops below `--min-credit`,
+- several games in a row fail.
+
+Before any game has finished, each game is assumed to cost `first_game_estimate_usd` (default $0.10).
+`--alternate-roles` swaps the trio and imposter models every second game. In the terminal, `--parallel 3`
+runs three games at once, and pressing `Ctrl+C` stops after the current game (press it twice to abort).
+Defaults live under `[batch]` in `config.toml` and in the Settings panel. To see one batch's results,
+run `python3 analyze.py --list-batches`, then `python3 analyze.py --batch <id>`.
+
+### 7. Look at the results
 
 Every game is saved in the `logs/` folder:
 
@@ -187,6 +207,7 @@ in an elimination. `analyze.py` compares your results against that.
 
 ```
 run.py                  start here: launches the app and opens your browser
+batch.py                run many games in a row from the terminal
 config.toml             all settings (models, reasoning, rules)
 analyze.py              aggregate stats across saved games
 imposter_game/

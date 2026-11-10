@@ -183,7 +183,7 @@ class TestRoundTrip(SettingsBase):
 
 class TestSchema(unittest.TestCase):
     SECTIONS = {"trio": C.ModelConfig, "imposter": C.ModelConfig, "rules": C.RulesConfig,
-                "paraphrase": C.ParaphraseConfig, "api": C.ApiConfig}
+                "paraphrase": C.ParaphraseConfig, "api": C.ApiConfig, "batch": C.BatchConfig}
 
     def test_schema_matches_config_keys(self):
         ids = [e["id"] for e in C.settings_schema()]
@@ -194,7 +194,7 @@ class TestSchema(unittest.TestCase):
     def test_entries_well_formed(self):
         schema = C.settings_schema()
         by_id = {e["id"]: e for e in schema}
-        groups = {"Players & models", "Game flow", "Voting", "Fairness", "Text limits", "Paraphrase", "API"}
+        groups = {"Players & models", "Game flow", "Voting", "Fairness", "Text limits", "Paraphrase", "API", "Batch"}
         for e in schema:
             self.assertIn(e["group"], groups)
             self.assertIn(e["type"], ("string", "int", "float", "bool", "enum", "string_list", "model"))

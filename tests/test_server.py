@@ -768,5 +768,136 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("unreachable", res["error"])
 
 
+def _engine_has_batch() -> bool:
+    try:
+        from imposter_game import batch
+        return hasattr(batch, "BatchRunner")
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_engine_has_batch(), "engine has no batch mode yet")
+class BatchTests(ServerTestBase):
+    def tearDown(self):
+        c = self.controller
+        if c.batch_active:
+            c.batch.abort()
+        self.assertTrue(c.wait_idle(60))
+        c.mock_options = {"delay": 0}
+        super().tearDown()
+
+    def wait_batch_done(self, reader: SSEReader, timeout: float = 120) -> dict:
+        batch_id = self.controller.batch.batch_id  # ignore a previous batch replayed on connect
+        ev = reader.wait_for(lambda e: e.get("type") == "batch_finished" and e.get("batch_id") == batch_id, timeout)
+        self.assertIsNotNone(ev, f"no batch_finished; last events: {reader.types()[-10:]}")
+        self.assertTrue(self.controller.wait_idle(30))
+        return ev
+
+    def test_info_and_plan(self):
+        status, info = self.get_json("/api/batch")
+        self.assertEqual(status, 200, info)
+        self.assertFalse(info["active"])
+        self.assertIn("games", info["defaults"])
+        self.assertTrue(info["plan"])
+        status, res = self.post("/api/batch/plan", body={"options": {"games": 5, "budget_usd": None}})
+        self.assertTrue(res["ok"], res)
+        self.assertIn("5 games", res["plan"])
+        # Never unbounded: no game limit and no budget is refused.
+        status, res = self.post("/api/batch/plan", body={"options": {"games": 0, "budget_usd": None}})
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["message"])
+        status, res = self.post("/api/batch/plan", body={"options": {"games": "lots"}})
+        self.assertFalse(res["ok"])
+
+    def test_batch_runs_to_games_limit_and_replays(self):
+        reader = self.sse()
+        status, res = self.post("/api/batch/start", body={"options": {"games": 3, "budget_usd": None,
+                                                                      "alternate_roles": True}})
+        self.assertEqual(status, 200, res)
+        self.assertTrue(res["status"]["batch"]["active"])
+        done = self.wait_batch_done(reader)
+        self.assertEqual(done["stop_reason"], "games_limit")
+        mine = [e for e in reader.events if e.get("batch_id") == done["batch_id"]]
+        types = [e.get("type") for e in mine]
+        for t in ("batch_started", "batch_progress", "batch_game_started", "game_started", "game_over"):
+            self.assertIn(t, types)
+        started = [e for e in mine if e.get("type") == "batch_game_started"]
+        self.assertEqual([e["batch_index"] for e in started], [1, 2, 3])
+        self.assertEqual([e["roles_swapped"] for e in started], [False, True, False])
+        self.assertEqual(len([e for e in mine if e.get("type") == "game_over"]), 3)
+        st = self.wait_state({"finished", "idle"})
+        self.assertFalse(st["batch"]["active"])
+        # The batch is over: normal play works again.
+        self.assertEqual(self.post("/api/new_game")[0], 200)
+        # A late client gets the batch events + only the latest game's events.
+        late = self.sse()
+        self.assertIsNotNone(late.wait_for(lambda e: e.get("type") == "status", 10))
+        late_types = late.types()
+        self.assertIn("batch_finished", late_types)
+        game_ids = {e.get("game_id") for e in late.events
+                    if e.get("type") not in ("status",) and not str(e.get("type")).startswith("batch_")}
+        self.assertLessEqual(len(game_ids), 1)
+        # Stats saw the batch's games.
+        self.assertGreaterEqual(self.get_json("/api/stats")[1]["num_games"], 3)
+
+    def test_refused_while_running_and_graceful_stop(self):
+        self.controller.mock_options = {"delay": 0.03}
+        reader = self.sse()
+        status, res = self.post("/api/batch/start", body={"options": {"games": 6, "budget_usd": None}})
+        self.assertEqual(status, 200, res)
+        for path in ("/api/new_game", "/api/run_all", "/api/next_round", "/api/pause", "/api/batch/start"):
+            status, _ = self.post(path, body={"options": {"games": 1}})
+            self.assertEqual(status, 409, path)
+        bid = self.controller.batch.batch_id
+        self.assertIsNotNone(reader.wait_for(lambda e: e.get("type") == "batch_game_started" and e.get("batch_id") == bid, 30))
+        status, res = self.post("/api/batch/stop")
+        self.assertEqual(status, 200, res)
+        done = self.wait_batch_done(reader)
+        self.assertEqual(done["stop_reason"], "stopped")
+        self.assertLess(done["totals"]["games_started"], 6)
+        overs = [e for e in reader.events if e.get("type") == "game_over" and e.get("batch_id") == done["batch_id"]]
+        self.assertTrue(overs and all(e["outcome"] != "aborted" for e in overs))  # the running game finished
+        self.assertEqual(self.post("/api/batch/stop")[0], 409)
+
+    def test_abort(self):
+        self.controller.mock_options = {"delay": 0.03}
+        reader = self.sse()
+        self.assertEqual(self.post("/api/batch/start", body={"options": {"games": 5, "budget_usd": None}})[0], 200)
+        bid = self.controller.batch.batch_id
+        self.assertIsNotNone(reader.wait_for(lambda e: e.get("type") == "message" and e.get("batch_id") == bid, 30))
+        status, res = self.post("/api/batch/abort")
+        self.assertEqual(status, 200, res)
+        done = self.wait_batch_done(reader)
+        self.assertEqual(done["stop_reason"], "aborted")
+        self.assertIsNotNone(reader.wait_for(lambda e: e.get("type") == "game_over" and e.get("outcome") == "aborted"
+                                             and e.get("batch_id") == done["batch_id"], 5))
+
+    def test_refused_while_a_game_runs(self):
+        self.controller.mock_options = {"delay": 0.05}
+        self.assertEqual(self.post("/api/new_game")[0], 200)
+        self.assertEqual(self.post("/api/run_all")[0], 200)
+        status, res = self.post("/api/batch/start", body={"options": {"games": 2}})
+        self.assertEqual(status, 409)
+        self.assertIn("running", res["message"])
+
+    def test_origin_protection(self):
+        for path in ("/api/batch/start", "/api/batch/stop", "/api/batch/abort", "/api/batch/plan"):
+            status, _ = self.post(path, headers={"Origin": "http://evil.example"}, body={"options": {"games": 1}})
+            self.assertEqual(status, 403, path)
+        self.assertFalse(self.controller.batch_active)
+        status, _, _ = self.get("/api/batch", headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_credit(self):
+        status, res = self.get_json("/api/credit")
+        self.assertEqual(status, 200)
+        self.assertIsNone(res["credit_usd"])  # mock mode
+        real = GameController(CONFIG, mock=False, log_dir=self.tmp)
+        real.credit_checker = lambda: 12.5     # injected: never the network
+        self.assertEqual(real.credit()["credit_usd"], 12.5)
+        real.credit_checker = lambda: None
+        self.assertIsNone(real.credit(force=True)["credit_usd"])
+
+
 if __name__ == "__main__":
     unittest.main()

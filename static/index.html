@@ -20,6 +20,7 @@
       <button id="btn-settings" type="button" class="ghost" title="Models, rules and other options (config.toml)">Settings ⚙</button>
       <button id="btn-prompts" type="button" class="ghost" title="View and edit the prompts the players are given">Prompts ✎</button>
       <span class="controls-sep" aria-hidden="true"></span>
+      <button id="btn-batch" type="button" title="Play many games in a row automatically, until a limit is reached">Batch ▶▶</button>
       <button id="btn-new" type="button" title="Reload config.toml and set up a fresh game">New game</button>
       <button id="btn-next" type="button" class="primary" title="Play until the end of the next round (or vote)">Next round ▶</button>
       <button id="btn-all" type="button" title="Play until the game is over">Run whole game ⏩</button>
@@ -38,6 +39,7 @@
 
   <main class="layout">
     <aside class="sidebar">
+      <section class="panel batch-panel" id="batch-panel" hidden aria-labelledby="batch-h"></section>
       <section class="panel" aria-labelledby="players-h">
         <div class="panel-head">
           <h2 id="players-h">Players</h2>
@@ -137,7 +139,56 @@
     </section>
   </div>
 
+  <div id="batch-dialog" class="modal" hidden>
+    <div class="drawer-backdrop" id="bd-backdrop"></div>
+    <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="bd-title">
+      <header class="drawer-head">
+        <h2 id="bd-title">Run a batch of games</h2>
+        <span class="spacer"></span>
+        <button type="button" id="bd-close" class="icon-btn" title="Close (Esc)" aria-label="Close">×</button>
+      </header>
+      <div class="modal-body">
+        <p class="small muted">Plays one game after another automatically until a limit is reached. You can watch each
+          game live and stop at any time. Settings and prompts are read once, when the batch starts.</p>
+        <div class="bd-grid">
+          <label class="bd-field">
+            <span class="sd-label">Number of games</span>
+            <input type="number" id="bd-games" min="0" step="1" inputmode="numeric">
+            <span class="small muted">0 = no game limit (then a spending limit is required).</span>
+          </label>
+          <label class="bd-field">
+            <span class="sd-label">Spending limit ($)</span>
+            <input type="number" id="bd-budget" min="0" step="0.01" inputmode="decimal" placeholder="no limit">
+            <span class="small muted">No new game starts if it could push the total over this.</span>
+          </label>
+          <label class="bd-field" id="bd-credit-field">
+            <span class="sd-label">Stop if my OpenRouter credit falls below ($)</span>
+            <input type="number" id="bd-min-credit" min="0" step="0.01" inputmode="decimal" placeholder="off">
+            <span class="small muted" id="bd-credit">Checking your credit…</span>
+          </label>
+          <label class="bd-field">
+            <span class="sd-label">Stop after this many failed games in a row</span>
+            <input type="number" id="bd-errors" min="0" step="1" inputmode="numeric">
+            <span class="small muted">0 = never stop because of errors.</span>
+          </label>
+          <label class="bd-check">
+            <input type="checkbox" id="bd-alternate" class="switch">
+            <span><b>Alternate roles</b><br><span class="small muted">Every second game swaps the trio and imposter models.</span></span>
+          </label>
+        </div>
+        <div id="bd-plan" class="bd-plan" aria-live="polite"></div>
+      </div>
+      <footer class="sd-foot">
+        <div id="bd-msg" class="sd-msg small"></div>
+        <span class="spacer"></span>
+        <button type="button" id="bd-cancel">Cancel</button>
+        <button type="button" id="bd-start" class="primary">Start batch ▶▶</button>
+      </footer>
+    </section>
+  </div>
+
   <script src="/static/app.js"></script>
+  <script src="/static/batch.js"></script>
   <script src="/static/settings.js"></script>
   <script src="/static/prompts.js"></script>
 </body>

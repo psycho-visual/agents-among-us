@@ -442,6 +442,57 @@ class OpenRouterClient:
 
 
 # ---------------------------------------------------------------------------
+# Remaining credit (for batch mode's "stop when credit falls below $X")
+# ---------------------------------------------------------------------------
+#
+# Verified against OpenRouter's docs (November 2026):
+# * https://openrouter.ai/docs/api-reference/limits  ->  GET /api/v1/key with the normal API key returns
+#   data.limit_remaining: "Remaining credits for the key, or null if unlimited" (plus data.limit, data.usage).
+# * https://openrouter.ai/docs/api-reference/get-credits  ->  GET /api/v1/credits returns data.total_credits and
+#   data.total_usage (account balance = total_credits - total_usage), but it needs a *management* key, so with a
+#   normal key it usually fails. We try it anyway and use whichever numbers we get (the smaller one wins).
+
+class CreditChecker:
+    """Callable returning the remaining OpenRouter credit in USD, or None if it can't be determined.
+
+    `last_info` explains the latest answer (source used, or why it is unknown).
+    """
+
+    def __init__(self, api_key: str | None, api_cfg=None, sleep=time.sleep):
+        self.api_key = api_key
+        self._client = OpenRouterClient(api_key or "", api_cfg, sleep=sleep) if api_key else None
+        self.last_info: dict = {}
+
+    def __call__(self) -> float | None:
+        if self._client is None:
+            self.last_info = {"remaining_usd": None, "error": "no API key"}
+            return None
+        found: dict[str, float] = {}
+        errors: list[str] = []
+        try:
+            key = _dict(self._client._request("GET", "/key", None, timeout=20).get("data"))
+            remaining = _float(key.get("limit_remaining"))
+            if remaining is not None:
+                found["key_limit_remaining"] = remaining
+        except OpenRouterError as e:
+            errors.append(f"/key: {e}")
+        try:
+            credits = _dict(self._client._request("GET", "/credits", None, timeout=20).get("data"))
+            total, used = _float(credits.get("total_credits")), _float(credits.get("total_usage"))
+            if total is not None and used is not None:
+                found["account_balance"] = total - used
+        except OpenRouterError as e:
+            errors.append(f"/credits: {e}")
+        if not found:
+            self.last_info = {"remaining_usd": None,
+                              "error": "; ".join(errors) or "unlimited key and no account balance available"}
+            return None
+        source = min(found, key=found.get)
+        self.last_info = {"remaining_usd": found[source], "source": source, "values": found}
+        return found[source]
+
+
+# ---------------------------------------------------------------------------
 # Mock client (offline, free, deterministic per seed)
 # ---------------------------------------------------------------------------
 

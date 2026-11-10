@@ -112,12 +112,25 @@ class ParaphraseConfig:
 
 
 @dataclass
+class BatchConfig:
+    """Defaults for batch mode (many games in a row). See [batch] in config.toml."""
+    games: int = 20                       # max games (0 = no game limit; then budget_usd is required)
+    budget_usd: float | None = 1.00      # max total spend for the batch (None = no budget limit)
+    min_credit_usd: float | None = None  # stop if the OpenRouter credit left falls below this (None = off)
+    alternate_roles: bool = False         # even-numbered games swap the trio and imposter models
+    stop_after_errors: int = 3            # stop after this many failed games in a row (0 = never)
+    parallel: int = 1                     # games at once (command line only; the browser runs one at a time)
+    first_game_estimate_usd: float = 0.10  # cost guess for the budget check before any game has finished
+
+
+@dataclass
 class GameConfig:
     trio: ModelConfig
     imposter: ModelConfig
     rules: RulesConfig = field(default_factory=RulesConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     paraphrase: ParaphraseConfig = field(default_factory=ParaphraseConfig)
+    batch: BatchConfig = field(default_factory=BatchConfig)
     api_key: str | None = field(default=None, repr=False)
     source_path: str | None = None
 
@@ -134,6 +147,7 @@ class GameConfig:
             "rules": asdict(self.rules),
             "api": asdict(self.api),
             "paraphrase": asdict(self.paraphrase),
+            "batch": asdict(self.batch),
             "source_path": self.source_path,
         }
 
@@ -305,6 +319,51 @@ def _paraphrase_section(table: dict, file: str) -> ParaphraseConfig:
     return p
 
 
+def _optional_money(table: dict, key: str, default, where: str):
+    """A dollar amount that may be left empty ("") to switch it off."""
+    value = table.get(key, "" if default is None else default)
+    if value == "" or value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f'{where} {key} must be an amount like 1.00, or "" for none (got {value!r})')
+    return float(value)
+
+
+def _batch_section(table: dict, file: str) -> BatchConfig:
+    where = f"{file}: [batch]"
+    d = BatchConfig()
+    b = BatchConfig(
+        games=_get(table, "games", d.games, where, int),
+        budget_usd=_optional_money(table, "budget_usd", d.budget_usd, where),
+        min_credit_usd=_optional_money(table, "min_credit_usd", d.min_credit_usd, where),
+        alternate_roles=_get(table, "alternate_roles", d.alternate_roles, where, bool),
+        stop_after_errors=_get(table, "stop_after_errors", d.stop_after_errors, where, int),
+        parallel=_get(table, "parallel", d.parallel, where, int),
+        first_game_estimate_usd=_get(table, "first_game_estimate_usd", d.first_game_estimate_usd, where, float),
+    )
+    validate_batch_limits(b, where)
+    return b
+
+
+def validate_batch_limits(b, where: str = "[batch]") -> None:
+    """Shared by config loading, the CLI and the GUI: a batch must always be bounded."""
+    if b.games < 0:
+        raise ConfigError(f"{where} games cannot be negative (got {b.games})")
+    if b.budget_usd is not None and b.budget_usd <= 0:
+        raise ConfigError(f'{where} budget_usd must be more than 0, or "" for no budget (got {b.budget_usd})')
+    if b.games == 0 and b.budget_usd is None:
+        raise ConfigError(f"{where} budget_usd is needed when games = 0 (no game limit): a batch must have a "
+                          "game limit, a spending limit, or both")
+    if b.min_credit_usd is not None and b.min_credit_usd < 0:
+        raise ConfigError(f"{where} min_credit_usd cannot be negative (got {b.min_credit_usd})")
+    if b.stop_after_errors < 0:
+        raise ConfigError(f"{where} stop_after_errors cannot be negative (got {b.stop_after_errors})")
+    if not 1 <= b.parallel <= 8:
+        raise ConfigError(f"{where} parallel must be between 1 and 8 (got {b.parallel})")
+    if b.first_game_estimate_usd < 0:
+        raise ConfigError(f"{where} first_game_estimate_usd cannot be negative (got {b.first_game_estimate_usd})")
+
+
 def _api_section(table: dict, file: str) -> ApiConfig:
     where = f"{file}: [api]"
     d = ApiConfig()
@@ -340,6 +399,7 @@ def config_from_dict(data: dict, file: str = "config", api_key: str | None = Non
         rules=_rules_section(data.get("rules", {}) or {}, file),
         api=_api_section(data.get("api", {}) or {}, file),
         paraphrase=_paraphrase_section(data.get("paraphrase", {}) or {}, file),
+        batch=_batch_section(data.get("batch", {}) or {}, file),
         api_key=api_key,
     )
     return cfg
@@ -507,6 +567,29 @@ def settings_schema() -> list[dict]:
         _s("paraphrase.max_output_tokens", "Paraphrase", "Paraphrase max output tokens",
            "Token budget per rewritten message.", "int", p.max_output_tokens, min=16, max=200000, step=100,
            visible_if=para_on, advanced=True),
+        # --- Batch
+        _s("batch.games", "Batch", "Games per batch",
+           "Batch mode plays games one after another until a limit is reached. 0 = no game limit (then a "
+           "spending limit is required).", "int", BatchConfig().games, min=0, max=10000, step=1),
+        _s("batch.budget_usd", "Batch", "Spending limit ($)",
+           "Stop the batch before it would spend more than this. A new game only starts if the most expensive "
+           "game so far would still fit. Empty = no spending limit.", "float", BatchConfig().budget_usd,
+           min=0.0, max=10000.0, step=0.5, nullable=True),
+        _s("batch.min_credit_usd", "Batch", "Stop when credit falls below ($)",
+           "Optional: before each game, check your OpenRouter credit and stop if less than this is left. "
+           "Empty = don't check.", "float", None, min=0.0, max=10000.0, step=1.0, nullable=True),
+        _s("batch.alternate_roles", "Batch", "Alternate roles",
+           "Every second game swaps the trio and imposter models, so each model plays both sides.", "bool",
+           BatchConfig().alternate_roles),
+        _s("batch.stop_after_errors", "Batch", "Stop after errors in a row",
+           "Stop the batch after this many games in a row end in an error (0 = never stop for errors).",
+           "int", BatchConfig().stop_after_errors, min=0, max=100, step=1),
+        _s("batch.parallel", "Batch", "Games at once (command line)",
+           "How many games python batch.py runs at the same time. The browser always runs one at a time.",
+           "int", BatchConfig().parallel, min=1, max=8, step=1, advanced=True),
+        _s("batch.first_game_estimate_usd", "Batch", "First game cost estimate ($)",
+           "Cost guess used by the spending limit before any game of the batch has finished.", "float",
+           BatchConfig().first_game_estimate_usd, min=0.0, max=100.0, step=0.01, advanced=True),
         # --- API
         _s("api.max_output_tokens", "API", "Default max output tokens",
            "Token budget per reply (including hidden reasoning) for roles without their own setting. Empty "
@@ -530,13 +613,17 @@ def settings_schema() -> list[dict]:
     ]
 
 
+# Optional numbers written as "" in config.toml when switched off.
+_EMPTY_MEANS_NONE = {"api.temperature", "batch.budget_usd", "batch.min_credit_usd"}
+
+
 def _schema_by_id() -> dict[str, dict]:
     return {e["id"]: e for e in settings_schema()}
 
 
 def _value_from_toml(entry: dict, raw):
     """A value as found in the TOML file -> the settings representation."""
-    if entry["id"] == "api.temperature" and raw == "":
+    if entry["id"] in _EMPTY_MEANS_NONE and raw == "":
         return None
     if entry["type"] == "enum" and entry["choices"] and entry["choices"][0]["value"] == "" and isinstance(raw, str):
         return raw.strip().lower()
@@ -633,7 +720,7 @@ def _coerce(entry: dict, value):
 def _to_toml_value(entry: dict, value):
     """The settings value as it should be written into config.toml (None = remove the key)."""
     if value is None:
-        return "" if entry["id"] == "api.temperature" else None
+        return "" if entry["id"] in _EMPTY_MEANS_NONE else None
     return value
 
 

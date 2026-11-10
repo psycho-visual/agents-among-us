@@ -26,6 +26,12 @@ GET  /api/settings            -> settings schema + current values of config.toml
 POST /api/settings/validate   {values} -> {errors: {id: msg}, warnings: {id: msg}}
 POST /api/settings/save       {values, start_new_game} -> writes config.toml (comments kept, backup made)
 GET  /api/models              -> OpenRouter's public model list (cached 1 hour), for the model picker
+GET  /api/batch               -> current/last batch: progress, defaults from [batch], plan text
+POST /api/batch/plan  {options} -> plain-English plan for these options (+ validation error)
+POST /api/batch/start {options} -> run many games in a row (one at a time) in the background
+POST /api/batch/stop          -> finish the current game, start no more
+POST /api/batch/abort         -> abort the current game now
+GET  /api/credit              -> OpenRouter credit left (null in mock mode or when unknown)
 """
 
 from __future__ import annotations
@@ -133,10 +139,16 @@ def _load_engine() -> SimpleNamespace:
         from imposter_game import prompts as prompts_mod
     except Exception:  # an older engine without editable prompts
         prompts_mod = None
+    try:
+        from imposter_game import batch as batch_mod
+    except Exception:  # an older engine without batch mode
+        batch_mod = None
 
     return SimpleNamespace(
         config=config_mod,
         prompts=prompts_mod,
+        batch=batch_mod,
+        openrouter=or_mod,
         load_config=config_mod.load_config,
         Game=game_mod.Game,
         OpenRouterClient=or_mod.OpenRouterClient,
@@ -228,6 +240,13 @@ class GameController:
         self.models_fetcher = models_fetcher or fetch_openrouter_models
         self._models_lock = threading.Lock()
         self._models_cache: tuple[float, list[dict]] | None = None
+        # Batch mode
+        self.batch: Any = None                     # the current/last BatchRunner
+        self._batch_thread: threading.Thread | None = None
+        self._batch_history: list[dict] = []       # batch_* events of the current/last batch (for SSE replay)
+        self._batch_game_id: str | None = None     # game currently shown from the batch
+        self._credit_cache: tuple[float, dict] | None = None
+        self.credit_checker: Callable[[], float | None] | None = None  # tests inject a fake
         self._engine = engine
         self.engine_error: str | None = None
 
@@ -351,7 +370,7 @@ class GameController:
         q: queue.Queue = queue.Queue()
         with self._clients_lock:
             self._clients.append(q)
-            backlog = list(self._history)
+            backlog = list(self._batch_history) + list(self._history)
         return q, backlog
 
     def unsubscribe(self, q: queue.Queue) -> None:
@@ -409,6 +428,7 @@ class GameController:
                 "finished": finished,
                 "mode": self._mode,
                 "config_error": self.config_error,
+                "batch": self._batch_status(),
             }
 
     def broadcast_status(self) -> None:
@@ -443,6 +463,8 @@ class GameController:
     # ------------------------------------------------------------------ commands
     def new_game(self) -> tuple[bool, str]:
         with self._lock:
+            if self.batch_active:
+                return False, "A batch is running. Stop it first (in the batch panel)."
             if self.state in ("running", "pausing"):
                 return False, "A game is running. Pause it (and wait for the current turn to finish) first."
             if not self.reload_config():
@@ -479,6 +501,8 @@ class GameController:
     def start(self, mode: str) -> tuple[bool, str]:
         assert mode in ("round", "all")
         with self._lock:
+            if self.batch_active:
+                return False, "A batch is running. Stop it first (in the batch panel)."
             game = self.game
             if game is None:
                 return False, self.config_error or "There is no game yet. Click \"New game\"."
@@ -507,6 +531,8 @@ class GameController:
 
     def pause(self) -> tuple[bool, str]:
         with self._lock:
+            if self.batch_active:
+                return False, "A batch is running. Use “Stop after this game” or “Abort now” in the batch panel."
             if self.state == "running":
                 self.state = "pausing"
                 self._pause.set()
@@ -549,15 +575,23 @@ class GameController:
             self.broadcast_status()
 
     def wait_idle(self, timeout: float | None = None) -> bool:
-        """Block until the runner thread exits (used by tests and shutdown)."""
-        t = self._runner
-        if t is not None:
-            t.join(timeout)
-            return not t.is_alive()
+        """Block until the runner thread (and any batch thread) exits (used by tests and shutdown)."""
+        for t in (self._runner, self._batch_thread):
+            if t is not None:
+                t.join(timeout)
+                if t.is_alive():
+                    return False
         return True
 
     def shutdown(self) -> None:
         """Called on Ctrl+C: stop streams and mark an unfinished, started game as aborted."""
+        if self.batch_active:
+            try:
+                self.batch.abort()
+            except Exception:
+                traceback.print_exc()
+            if self._batch_thread is not None:
+                self._batch_thread.join(10)
         with self._lock:
             game = self.game
             started = self.state in ("running", "pausing", "paused")
@@ -571,6 +605,252 @@ class GameController:
         with self._clients_lock:
             for q in self._clients:
                 q.put(None)
+
+    # ------------------------------------------------------------------ batch mode
+    BATCH_OPTION_KEYS = ("games", "budget_usd", "min_credit_usd", "alternate_roles", "stop_after_errors")
+
+    @property
+    def batch_active(self) -> bool:
+        t = self._batch_thread
+        return t is not None and t.is_alive()
+
+    def _batch_status(self) -> dict | None:
+        r = self.batch
+        if r is None:
+            return None
+        return {"active": self.batch_active, "batch_id": getattr(r, "batch_id", None),
+                "stopping": bool(getattr(r, "_stop_requested", False)),
+                "game_id": self._batch_game_id}
+
+    def _batch_mod(self):
+        mod = getattr(self.engine, "batch", None)
+        if mod is None or not hasattr(mod, "BatchRunner"):
+            raise PromptError("This version of the game engine has no batch mode.", 501)
+        return mod
+
+    def _batch_options(self, overrides: Any):
+        """[batch] defaults from config.toml with the dialog's values on top (empty = off). GUI: 1 game at a time."""
+        mod = self._batch_mod()
+        if overrides is None:
+            overrides = {}
+        if not isinstance(overrides, dict):
+            raise PromptError("'options' must be an object.", 400)
+        base = dataclasses.asdict(getattr(self.cfg, "batch", None) or mod.BatchOptions())
+        base = {k: v for k, v in base.items() if k in {f.name for f in dataclasses.fields(mod.BatchOptions)}}
+
+        def num(key: str, value: Any, kind: type, nullable: bool):
+            if value is None or (isinstance(value, str) and not value.strip()):
+                return None if nullable else 0
+            try:
+                n = float(value)
+            except (TypeError, ValueError):
+                raise PromptError(f"{key.replace('_', ' ')} must be a number (got {value!r}).", 400)
+            if kind is int:
+                if n != int(n):
+                    raise PromptError(f"{key.replace('_', ' ')} must be a whole number.", 400)
+                return int(n)
+            return n
+
+        for key in self.BATCH_OPTION_KEYS:
+            if key not in overrides:
+                continue
+            v = overrides[key]
+            if key == "alternate_roles":
+                base[key] = bool(v)
+            elif key in ("games", "stop_after_errors"):
+                base[key] = num(key, v, int, False)
+            else:
+                base[key] = num(key, v, float, True)
+        base["parallel"] = 1  # the browser shows one game at a time
+        opts = mod.BatchOptions(**base)
+        try:
+            opts.validate()
+        except Exception as exc:
+            raise PromptError(str(exc), 400)
+        return opts
+
+    def _ensure_config(self) -> None:
+        if self.cfg is None or self.config_error:
+            with self._lock:
+                self.reload_config()
+
+    def batch_plan(self, overrides: Any) -> dict:
+        self._ensure_config()
+        if self.cfg is None:
+            return {"ok": False, "plan": "", "message": self.config_error or "No config loaded."}
+        try:
+            opts = self._batch_options(overrides)
+        except PromptError as exc:
+            if exc.status == 501:
+                raise
+            return {"ok": False, "plan": "", "message": str(exc)}
+        plan_fn = getattr(self._batch_mod(), "plan_text", None)
+        plan = plan_fn(opts, self.cfg, mock=self.mock) if callable(plan_fn) else ""
+        return {"ok": True, "plan": plan, "options": dataclasses.asdict(opts), "message": None}
+
+    def batch_info(self) -> dict:
+        self._ensure_config()
+        mod = self._batch_mod()
+        r = self.batch
+        defaults = None
+        if self.cfg is not None:
+            defaults = dataclasses.asdict(getattr(self.cfg, "batch", None) or mod.BatchOptions())
+        plan = self.batch_plan({}) if self.cfg is not None else {"plan": "", "message": self.config_error}
+        finished = next((e for e in reversed(self._batch_history) if e.get("type") == "batch_finished"), None)
+        return {
+            "ok": True,
+            "active": self.batch_active,
+            "batch_id": getattr(r, "batch_id", None),
+            "progress": r.state if r is not None else None,
+            "finished": finished,
+            "defaults": defaults,
+            "plan": plan.get("plan"),
+            "plan_error": plan.get("message"),
+            "mock": self.mock,
+            "running": self.running or self.batch_active,
+            "config_error": self.config_error,
+            "stop_reasons": dict(getattr(mod, "STOP_REASON_TEXT", {})),
+        }
+
+    def _on_batch_event(self, event: dict, generation: int) -> None:
+        if not isinstance(event, dict):
+            return
+        etype = str(event.get("type") or "")
+        if etype.startswith("batch_"):
+            with self._clients_lock:
+                if generation != self._generation:
+                    return
+                self._batch_history.append(event)
+                for q in self._clients:
+                    q.put(event)
+            if etype in ("batch_game_started", "batch_finished", "batch_progress"):
+                self.broadcast_status()
+            return
+        gid = event.get("game_id")
+        new_game = False
+        with self._clients_lock:
+            if generation != self._generation:
+                return
+            if gid and gid != self._batch_game_id:
+                # A new game of the batch: the live view (and SSE replay) now follows it.
+                self._batch_game_id = gid
+                self._history = []
+                new_game = True
+        if new_game:
+            running = dict(getattr(self.batch, "_running", {}) or {})
+            for slot in running.values():
+                g = slot.get("game") if isinstance(slot, dict) else None
+                if g is not None and getattr(g, "game_id", None) == gid:
+                    with self._lock:
+                        self.game = g
+        if etype == "game_over":
+            self._game_over = event
+        self._publish(event, store=True, generation=generation)
+        if new_game or etype in ("phase", "game_over", "vote_result") or (
+                etype == "thinking" and event.get("action") == "question"):
+            self.broadcast_status()  # keeps "Batch: game 4 of 20 — Round 2 · Blue asks" current
+
+    def batch_start(self, overrides: Any) -> dict:
+        mod = self._batch_mod()
+        with self._lock:
+            if self.batch_active:
+                raise PromptError("A batch is already running.", 409)
+            if self.state in ("running", "pausing"):
+                raise PromptError("A game is running. Pause it (or let it finish) before starting a batch.", 409)
+            if not self.reload_config():
+                raise PromptError(self.config_error or "Could not load the config.", 409)
+            opts = self._batch_options(overrides)
+            with self._clients_lock:
+                self._generation += 1
+                generation = self._generation
+                self._history = []
+                self._batch_history = []
+                self._batch_game_id = None
+            self._game_over = None
+            cfg = self.cfg
+            kwargs = {"options": opts, "prompts_dir": self.prompts_dir, "seed": self.seed}
+            if self.credit_checker is not None:
+                kwargs["credit_checker"] = self.credit_checker
+            try:
+                runner = _call_with_supported_kwargs(
+                    mod.BatchRunner, cfg, lambda: self._make_client(cfg),
+                    lambda ev, g=generation: self._on_batch_event(ev, g),
+                    self.log_dir, mock=self.mock, **kwargs)
+            except Exception as exc:
+                traceback.print_exc()
+                raise PromptError(f"Could not start the batch: {exc}", 400)
+            self.batch = runner
+            self.game = None
+            self.state = "running"
+            self._mode = "batch"
+            self._batch_thread = threading.Thread(target=self._batch_loop, args=(runner, generation),
+                                                  name="batch-runner", daemon=True)
+            self._batch_thread.start()
+        self.broadcast_status()
+        return {"ok": True, "message": "Batch started.", "batch_id": runner.batch_id, "status": self.status()}
+
+    def _batch_loop(self, runner: Any, generation: int) -> None:
+        try:
+            runner.run()
+        except Exception as exc:
+            traceback.print_exc()
+            self._server_error(f"The batch stopped because of an error: {exc!r}", generation)
+        finally:
+            with self._lock:
+                if self.batch is runner:
+                    game = self.game
+                    try:
+                        finished = game is not None and bool(game.is_finished())
+                    except Exception:
+                        finished = True
+                    self.state = "finished" if finished else "idle"
+                    self._mode = "round"
+            # status() reads batch_active from the thread, which is still alive here: publish after it ends.
+            threading.Thread(target=self._status_after_batch, args=(threading.current_thread(),), daemon=True).start()
+
+    def _status_after_batch(self, t: threading.Thread) -> None:
+        t.join(5)
+        self.broadcast_status()
+
+    def batch_stop(self) -> dict:
+        if not self.batch_active:
+            raise PromptError("No batch is running.", 409)
+        self.batch.request_stop()
+        self.broadcast_status()
+        return {"ok": True, "message": "The batch will stop after the current game.", "status": self.status()}
+
+    def batch_abort(self) -> dict:
+        if not self.batch_active:
+            raise PromptError("No batch is running.", 409)
+        self.batch.abort()
+        self.broadcast_status()
+        return {"ok": True, "message": "Aborting the batch.", "status": self.status()}
+
+    def credit(self, force: bool = False) -> dict:
+        """OpenRouter credit left in USD (None in mock mode or if it can't be found out). Cached for a minute."""
+        if self.mock:
+            return {"ok": True, "credit_usd": None, "mock": True, "message": "Mock mode: no real credit is used."}
+        cached = self._credit_cache
+        if cached and not force and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        checker = self.credit_checker
+        if checker is None:
+            self._ensure_config()
+            key = self._find_api_key(self.cfg) if self.cfg is not None else None
+            if not key:
+                return {"ok": True, "credit_usd": None, "mock": False, "message": "No API key, so the credit is unknown."}
+            cls = getattr(getattr(self.engine, "openrouter", None), "CreditChecker", None)
+            if cls is None:
+                return {"ok": True, "credit_usd": None, "mock": False, "message": "This engine can't check credit."}
+            checker = cls(key, getattr(self.cfg, "api", None))
+        try:
+            value = checker()
+            msg = None if value is not None else "OpenRouter didn't say how much credit is left (e.g. a key without a limit)."
+        except Exception as exc:
+            value, msg = None, f"Could not check the credit: {exc}"
+        res = {"ok": True, "credit_usd": value, "mock": False, "message": msg}
+        self._credit_cache = (time.monotonic(), res)
+        return res
 
     # ------------------------------------------------------------------ settings (config.toml editor)
     def _config_fn(self, name: str):
@@ -857,6 +1137,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._prompt_action(self.controller.settings_get)
             if path == "/api/models":
                 return self._send_json(self.controller.models())
+            if path == "/api/batch":
+                return self._prompt_action(self.controller.batch_info)
+            if path == "/api/credit":
+                return self._prompt_action(self.controller.credit)
             if path == "/api/prompts":
                 return self._prompt_action(self.controller.prompts_list)
             if path == "/api/prompts/preview":
@@ -877,7 +1161,7 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length > 0 else b""
         path = urlsplit(self.path).path
         c = self.controller
-        if path.startswith("/api/prompts/") or path.startswith("/api/settings/"):
+        if path.startswith(("/api/prompts/", "/api/settings/", "/api/batch/")):
             try:
                 body = json.loads(raw.decode("utf-8") or "{}")
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -890,6 +1174,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "/api/prompts/reset": lambda: c.prompts_reset(body.get("id")),
                 "/api/settings/validate": lambda: c.settings_validate(body.get("values")),
                 "/api/settings/save": lambda: c.settings_save(body.get("values"), bool(body.get("start_new_game"))),
+                "/api/batch/plan": lambda: c.batch_plan(body.get("options")),
+                "/api/batch/start": lambda: c.batch_start(body.get("options")),
+                "/api/batch/stop": c.batch_stop,
+                "/api/batch/abort": c.batch_abort,
             }
             action = prompt_actions.get(path)
             if action is None:
