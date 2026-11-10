@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Agents Among Us</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="sticky-top">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <h1>Agents Among Us</h1>
+      <span id="mock-badge" class="badge badge-mock" hidden title="Fake models: no API calls, no cost">MOCK</span>
+    </div>
+    <nav class="controls" aria-label="Game controls">
+      <button id="btn-new" type="button" title="Reload config.toml and set up a fresh game">New game</button>
+      <button id="btn-next" type="button" class="primary" title="Play until the end of the next round (or vote)">Next round ▶</button>
+      <button id="btn-all" type="button" title="Play until the game is over">Run whole game ⏩</button>
+      <button id="btn-pause" type="button" title="Stop after the current turn finishes">Pause ⏸</button>
+    </nav>
+  </header>
+
+  <div class="statusbar">
+    <span id="status-dot" class="status-dot" aria-hidden="true"></span>
+    <span id="status-text" class="status-text">Connecting…</span>
+    <span id="status-next" class="status-next"></span>
+  </div>
+  </div>
+
+  <div id="banners" class="banners" aria-live="polite"></div>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="panel" aria-labelledby="players-h">
+        <div class="panel-head">
+          <h2 id="players-h">Players</h2>
+          <label class="toggle" title="Hide who is the imposter (roles, models and private reasoning) until the game is over">
+            <input type="checkbox" id="hide-roles">
+            <span>Hide roles (play detective)</span>
+          </label>
+        </div>
+        <div id="players" class="players"><p class="muted small">No game yet.</p></div>
+        <div id="settings" class="settings small muted"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="cost-h">
+        <div class="panel-head">
+          <h2 id="cost-h">Cost &amp; tokens</h2>
+          <span id="cost-note" class="muted small"></span>
+        </div>
+        <div class="cost-total"><span id="cost-total">$0</span></div>
+        <dl class="kv">
+          <dt>Input tokens</dt><dd id="tok-in">0</dd>
+          <dt>Output tokens</dt><dd id="tok-out">0</dd>
+          <dt>…of which reasoning</dt><dd id="tok-reason">0</dd>
+          <dt>API calls</dt><dd id="num-calls">0</dd>
+        </dl>
+        <div id="cost-by-model" class="by-model role-info"></div>
+      </section>
+
+      <details class="panel stats-panel" id="stats-panel">
+        <summary><h2>Past games</h2><span class="muted small" id="stats-count"></span></summary>
+        <div id="stats-body" class="stats-body"><p class="muted small">Loading…</p></div>
+      </details>
+    </aside>
+
+    <section class="main-col" aria-label="Game transcript">
+      <div id="transcript" class="transcript">
+        <div class="empty-state" id="empty-state">
+          <h2>Four AIs. One imposter.</h2>
+          <p>Three players are copies of the same model; one is a different model trying to blend in.
+            They introduce themselves, take turns asking each other questions, and then vote someone out.</p>
+          <p>Click <b>Next round ▶</b> to play step by step, or <b>Run whole game ⏩</b> to watch it all.</p>
+        </div>
+      </div>
+      <button id="jump-latest" class="jump-latest" type="button" hidden>↓ Jump to latest</button>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

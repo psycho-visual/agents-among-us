@@ -1,0 +1,17 @@
+# Runtime output (game logs, transcripts, summary.jsonl)
+logs/
+
+# Your OpenRouter API key lives here - never commit it
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

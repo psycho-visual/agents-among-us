@@ -1,0 +1,134 @@
+# =============================================================================
+#  Agents Among Us — game configuration
+# =============================================================================
+#  Four AI players: three copies of one model (the "trio") and one different
+#  model (the "imposter"). The trio tries to vote the imposter out; the imposter
+#  tries to get a trio member voted out.
+#
+#  Edit this file, then click New game in the browser (no restart needed).
+#  Lines starting with # are comments. Strings need "double quotes".
+#
+#  Your OpenRouter API key does NOT go here. Put it in the environment variable
+#  OPENROUTER_API_KEY, or in a file called `.env` next to this file containing:
+#      OPENROUTER_API_KEY=sk-or-...
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+#  The trio: three identical copies of this model.
+# -----------------------------------------------------------------------------
+[trio]
+# OpenRouter model id (see https://openrouter.ai/models).
+model = "anthropic/claude-haiku-5.5"
+# The name the trio members are told they are ("You are Claude Haiku 5.5").
+display_name = "Claude Haiku 5.5"
+# How hard the model thinks before answering:
+#   none | low | medium | high | xhigh | max     (leave "" to use the model's default)
+reasoning_effort = "high"
+# Optional: max tokens per call for this model, INCLUDING hidden reasoning.
+# Overrides [api] max_output_tokens below.
+max_output_tokens = 16000
+
+
+# -----------------------------------------------------------------------------
+#  The imposter: one copy of a different model.
+# -----------------------------------------------------------------------------
+[imposter]
+model = "openai/gpt-6-luna"
+display_name = "GPT-6 Luna"
+reasoning_effort = "max"
+# "max" effort thinks a lot, so give it more room.
+max_output_tokens = 32000
+
+
+# -----------------------------------------------------------------------------
+#  Game rules
+# -----------------------------------------------------------------------------
+[rules]
+# What players may say about which model they are:
+#   "lie_allowed" — anyone may claim to be any model, truthfully or not.
+#   "no_names"    — nobody may mention a model or AI-company name in public.
+#                   The game detects violations (see banned_names below).
+name_rule = "lie_allowed"
+
+# Only used with name_rule = "no_names": replace a forbidden name with
+# [REDACTED] before the other players see it. (The log keeps the original.)
+redact_violations = true
+
+# Words that count as a name violation under "no_names" (case-insensitive,
+# whole words only). Both models' display names and ids are always added.
+banned_names = [
+  "claude", "anthropic", "haiku", "sonnet", "opus",
+  "gpt", "openai", "chatgpt", "codex", "o1", "o3", "o4",
+  "gemini", "gemma", "google", "deepmind", "bard",
+  "llama", "meta",
+  "mistral", "mixtral",
+  "grok", "xai",
+  "deepseek", "qwen", "alibaba", "kimi", "moonshot", "glm", "zhipu",
+  "microsoft", "copilot", "cohere", "command r",
+  "luna", "sol",
+]
+
+# A vote is held automatically after every this many rounds.
+# (One round = every player asks one question and everybody answers it.)
+rounds_before_vote = 2
+
+# Votes needed to be voted out (there are 4 voters, nobody may vote for themselves).
+vote_threshold = 3
+
+# What happens when a vote ends with nobody reaching the threshold:
+#   "end"      — the game ends with no winner ("no_decision").
+#   "continue" — keep playing; vote again after another `rounds_before_vote`
+#                rounds, up to `max_rounds` rounds in total (a final vote is
+#                always held at max_rounds). Then the game ends "no_decision".
+on_no_decision = "end"
+
+# Only used with on_no_decision = "continue".
+max_rounds = 6
+
+# How players answer each question:
+#   "simultaneous" — everyone answers blind, at the same time; answers are revealed together.
+#   "sequential"   — players answer one after another (seat order, starting after
+#                    the asker) and each sees the answers given before theirs.
+answer_mode = "simultaneous"
+
+# After each vote, show everybody who voted for whom.
+reveal_votes = true
+
+# The four seat names. Neutral names, so they don't hint at any model.
+player_names = ["Red", "Blue", "Green", "Yellow"]
+
+# true  — the imposter sits in a random seat each game.
+# false — the imposter always takes the LAST seat in player_names.
+shuffle_seats = true
+
+# Soft length limits given to the players (in words). Text more than twice
+# as long as the limit is cut off before the other players see it.
+intro_word_limit = 80
+question_word_limit = 40
+answer_word_limit = 100
+
+
+# -----------------------------------------------------------------------------
+#  API settings (OpenRouter)
+# -----------------------------------------------------------------------------
+[api]
+# Default maximum tokens per call, INCLUDING the model's hidden reasoning tokens
+# (used when [trio]/[imposter] don't set their own max_output_tokens).
+# If a model runs out before writing anything, the call is retried once with
+# double (up to 64000). Note: tokens spent on a cut-off call are still billed.
+max_output_tokens = 16000
+
+# Seconds to wait for one call before giving up (reasoning models can be slow).
+timeout_seconds = 300
+
+# How many times to retry a call after a network error / rate limit / server error.
+max_retries = 3
+
+# Sampling temperature. Leave "" to not send one (recommended: several reasoning
+# models reject non-default values).
+temperature = ""
+
+# Ask OpenRouter/providers to cache the repeated start of each prompt (cheaper,
+# faster). The transcript is append-only so caching works well. true or false.
+prompt_caching = true
