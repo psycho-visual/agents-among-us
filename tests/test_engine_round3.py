@@ -161,7 +161,8 @@ class TestDefaultPromptText(unittest.TestCase):
         trio = self.ps.system_prompt("Red", "trio", "Claude Haiku 5.5", rules, NAMES)
         imp = self.ps.system_prompt("Blue", "imposter", "GPT-6 Luna", rules, NAMES)
         for sp in (trio, imp):
-            self.assertTrue(sp.startswith('You are playing "Agents Among Us", a game for four players.\n'))
+            self.assertTrue(sp.startswith("YOUR SECRET ROLE\n"))
+            self.assertIn('\n\nYou are playing "Agents Among Us", a game for four players.\n', sp)
             self.assertNotIn("social-deduction", sp)
             self.assertIn("This is not a game about hidden actions, sabotage, or lying about what you did. "
                           "The only secret is which AI model each player is. The trio is trying to work out "
@@ -183,7 +184,8 @@ class TestDefaultPromptText(unittest.TestCase):
                       "Two of Blue, Green and Yellow are exact copies of you", trio)
         self.assertNotIn("GPT-6 Luna", trio)
         # Trio and imposter share the exact same rules text.
-        self.assertEqual(trio.split("YOUR SECRET ROLE")[0], imp.split("YOUR SECRET ROLE")[0])
+        rules_part = lambda sp: sp[sp.index("You are playing"):]  # noqa: E731
+        self.assertEqual(rules_part(trio), rules_part(imp))
 
     def test_tasks(self):
         self.assertEqual(self.ps.intro_task(40), (

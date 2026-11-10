@@ -1,0 +1,1 @@
+(Private reminder: you are the imposter, a different AI model from the other three. {others} are all copies of one other AI model, so there is nothing to work out about them. What matters is whether they can tell which player is not their model, i.e. which one is you.)

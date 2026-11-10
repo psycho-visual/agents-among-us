@@ -307,6 +307,7 @@ class Player:
     reasoning_effort: str | None
     max_tokens: int
     system_prompt: str = ""
+    reminder: str = ""          # private one-line role reminder put above every task
 
     def public_dict(self) -> dict:
         return {"name": self.name, "seat": self.seat, "role": self.role, "model": self.model,
@@ -392,6 +393,7 @@ class Game:
             p = Player(name=name, seat=i + 1, role=role, model=m.model, display_name=m.display_name,
                        reasoning_effort=m.reasoning_effort, max_tokens=cfg.max_tokens_for(role))
             p.system_prompt = self.prompts.system_prompt(name, role, m.display_name, self.rules, names)
+            p.reminder = self.prompts.reminder(name, role, m.display_name, names, self.rules)
             self.players.append(p)
         self.by_name = {p.name: p for p in self.players}
         self.imposter: Player | None = self.players[imp_index] if self.has_imposter else None
@@ -503,7 +505,12 @@ class Game:
         transcript = prompts.render_transcript(self._intros, self._entries)
         notes = "" if self.rules.reveal_votes else prompts.private_notes(self._own_votes[player.name])
         return [{"role": "system", "content": player.system_prompt},
-                {"role": "user", "content": prompts.user_message(transcript, task, notes)}]
+                {"role": "user", "content": prompts.user_message(transcript, task, notes, player.reminder)}]
+
+    @staticmethod
+    def _with_reminder(player: Player, text: str) -> str:
+        """A follow-up user message (retry), also starting with the role reminder."""
+        return f"{player.reminder}\n\n{text}" if player.reminder else text
 
     def _context(self, player: Player, **extra) -> dict:
         """Facts about a call for the mock client (so it never has to parse prompt text)."""
@@ -583,7 +590,8 @@ class Game:
         res, call_id = self._call(player, purpose, messages, round_no, context=context)
         if not (res.content or "").strip():
             retry = messages + [{"role": "assistant", "content": "(no reply)"},
-                                {"role": "user", "content": self.prompts.empty_reply_retry_message()}]
+                                {"role": "user", "content": self._with_reminder(
+                                    player, self.prompts.empty_reply_retry_message())}]
             res, call_id = self._call(player, purpose + "_retry_empty", retry, round_no, context=context)
         return res, call_id
 
@@ -802,8 +810,8 @@ class Game:
         first_problem = problem
         if target is None:
             retry = messages + [{"role": "assistant", "content": res.content or "(no reply)"},
-                                {"role": "user", "content": self.prompts.vote_retry_message(problem, valid_names,
-                                                                                           nobody)}]
+                                {"role": "user", "content": self._with_reminder(
+                                    p, self.prompts.vote_retry_message(problem, valid_names, nobody))}]
             res, call_id = self._call(p, "vote_retry", retry, self.rounds_completed, context={**ctx, "is_retry": True})
             target, problem = parse_vote(res.content, p.name, self.rules.player_names, nobody)
         voted_nobody = target == NOBODY
