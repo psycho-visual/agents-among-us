@@ -1,0 +1,5 @@
+MAYBE NO IMPOSTER
+- There is a {no_imposter_percent}% chance that this game has no imposter at all, in which case all four players are copies of one model.
+- If there is no imposter, all four players write their introductions at the same time, without seeing anyone else's.
+- In any vote you may vote for NOBODY instead of a player. A vote for NOBODY counts as not voting for anyone.
+- If there is no imposter and somebody is voted out, the trio loses (it voted out one of its own copies). If there is no imposter and the game ends without anybody being voted out, the trio wins.

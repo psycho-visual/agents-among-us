@@ -76,8 +76,9 @@ class ServerTestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tmp = Path(tempfile.mkdtemp(prefix="aau-test-logs-"))
+        cls.prompts_dir = cls.tmp / "prompts"  # never the repo's real prompts/ folder
         cls.controller = GameController(CONFIG, mock=True, log_dir=cls.tmp, mock_options={"delay": 0},
-                                        seed=7, keepalive_seconds=1.0)
+                                        seed=7, keepalive_seconds=1.0, prompts_dir=cls.prompts_dir)
         cls.server = make_server(cls.controller, "127.0.0.1", 0)
         cls.port = cls.server.server_address[1]
         cls.base = f"http://127.0.0.1:{cls.port}"
@@ -108,8 +109,9 @@ class ServerTestBase(unittest.TestCase):
         status, _, body = self.get(path)
         return status, json.loads(body)
 
-    def post(self, path: str, headers: dict | None = None):
-        req = urllib.request.Request(self.base + path, data=b"{}", method="POST",
+    def post(self, path: str, headers: dict | None = None, body: object = None):
+        data = b"{}" if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode("utf-8"))
+        req = urllib.request.Request(self.base + path, data=data, method="POST",
                                      headers={"Content-Type": "application/json", **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -402,6 +404,187 @@ class VoteCallTests(unittest.TestCase):
     def test_feature_off_emits_no_vote_call_events(self):
         events = self._play({"player_vote_calls": False}, seed=4)
         self.assertFalse([e for e in events if e["type"] == "vote_call_check"])
+
+
+def _engine_has_prompt_api() -> bool:
+    try:
+        from imposter_game import prompts
+        return callable(getattr(prompts, "list_templates", None))
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_engine_has_prompt_api(), "engine has no editable prompts yet")
+class PromptEndpointTests(ServerTestBase):
+    REPO_PROMPTS = ROOT / "prompts"
+
+    def setUp(self):
+        self.repo_prompts_existed = self.REPO_PROMPTS.exists()
+
+    def tearDown(self):
+        super().tearDown()
+        shutil.rmtree(self.prompts_dir, ignore_errors=True)
+        # The tests must never create the real prompts/ folder.
+        self.assertEqual(self.REPO_PROMPTS.exists(), self.repo_prompts_existed)
+
+    def list_prompts(self) -> dict:
+        status, data = self.get_json("/api/prompts")
+        self.assertEqual(status, 200, data)
+        return data
+
+    def pick(self, data: dict) -> dict:
+        """A template with at least one placeholder (so we can test unknown/unused placeholders)."""
+        for t in data["templates"]:
+            if t["placeholders"]:
+                return t
+        self.skipTest("no template with placeholders")
+
+    def test_list(self):
+        data = self.list_prompts()
+        self.assertTrue(data["ok"])
+        self.assertGreater(len(data["templates"]), 5)
+        for t in data["templates"]:
+            for key in ("id", "title", "description", "group", "placeholders", "required_markers",
+                        "text", "default_text", "modified"):
+                self.assertIn(key, t)
+            self.assertFalse(t["modified"])
+        self.assertRegex(data["prompt_version"], r"^[0-9a-f]{8}$")
+        self.assertFalse(data["modified"])
+        self.assertIn("New game", data["note"])
+
+    def test_validate_save_reset_round_trip(self):
+        data = self.list_prompts()
+        t = self.pick(data)
+        version0 = data["prompt_version"]
+
+        # Unknown placeholder -> error, and saving is refused.
+        bad = t["text"] + "\n{definitely_not_a_placeholder}"
+        status, res = self.post("/api/prompts/validate", body={"id": t["id"], "text": bad})
+        self.assertEqual(status, 200, res)
+        self.assertTrue(res["errors"])
+        status, res = self.post("/api/prompts/save", body={"id": t["id"], "text": bad})
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["errors"])
+        self.assertFalse((self.prompts_dir / f"{t['id']}.txt").exists())
+
+        # Malformed braces -> error.
+        status, res = self.post("/api/prompts/validate", body={"id": t["id"], "text": t["text"] + " {oops"})
+        self.assertTrue(res["errors"])
+
+        # A valid edit saves to the override folder and changes the version.
+        good = t["text"] + "\nBe brief."
+        status, res = self.post("/api/prompts/validate", body={"id": t["id"], "text": good})
+        self.assertEqual(res["errors"], [])
+        status, res = self.post("/api/prompts/save", body={"id": t["id"], "text": good})
+        self.assertEqual(status, 200, res)
+        self.assertTrue(res["ok"], res)
+        self.assertTrue((self.prompts_dir / f"{t['id']}.txt").exists())
+        data = self.list_prompts()
+        saved = {x["id"]: x for x in data["templates"]}[t["id"]]
+        self.assertTrue(saved["modified"])
+        self.assertEqual(saved["text"].strip(), good.strip())
+        self.assertTrue(data["modified"])
+        self.assertNotEqual(data["prompt_version"], version0)
+
+        # A new game picks up the edit (prompt version recorded on game_started).
+        self.assertEqual(self.post("/api/new_game")[0], 200)
+        data = self.list_prompts()
+        if data["current_game"]["prompt_version"] is not None:
+            self.assertEqual(data["current_game"]["prompt_version"], data["prompt_version"])
+
+        # Reset deletes the override and restores the default version.
+        status, res = self.post("/api/prompts/reset", body={"id": t["id"]})
+        self.assertEqual(status, 200, res)
+        self.assertTrue(res["ok"])
+        self.assertFalse((self.prompts_dir / f"{t['id']}.txt").exists())
+        data = self.list_prompts()
+        self.assertFalse({x["id"]: x for x in data["templates"]}[t["id"]]["modified"])
+        self.assertEqual(data["prompt_version"], version0)
+
+    def test_warning_for_missing_marker(self):
+        data = self.list_prompts()
+        with_marker = [t for t in data["templates"] if t["required_markers"]]
+        if not with_marker:
+            self.skipTest("no template with required markers")
+        t = with_marker[0]
+        text = t["text"]
+        for m in t["required_markers"]:
+            text = text.replace(m, "")
+        status, res = self.post("/api/prompts/validate", body={"id": t["id"], "text": text})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["warnings"], res)
+
+    def test_bad_requests(self):
+        status, res = self.post("/api/prompts/save", body={"id": "no_such_template", "text": "x"})
+        self.assertEqual(status, 404)
+        status, res = self.post("/api/prompts/validate", body={"text": "x"})
+        self.assertEqual(status, 400)
+        status, res = self.post("/api/prompts/save", body=b"not json")
+        self.assertEqual(status, 400)
+        status, res = self.post("/api/prompts/nope", body={})
+        self.assertEqual(status, 404)
+
+    def test_origin_protection(self):
+        t = self.list_prompts()["templates"][0]
+        for path, body in (("/api/prompts/save", {"id": t["id"], "text": t["text"] + " x"}),
+                           ("/api/prompts/reset", {"id": t["id"]}),
+                           ("/api/prompts/validate", {"id": t["id"], "text": "x"})):
+            status, _ = self.post(path, headers={"Origin": "http://evil.example"}, body=body)
+            self.assertEqual(status, 403, path)
+        self.assertFalse((self.prompts_dir / f"{t['id']}.txt").exists())
+        status, _, _ = self.get("/api/prompts", headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_preview(self):
+        status, res = self.get_json("/api/prompts/preview")
+        self.assertEqual(status, 200, res)
+        pv = res["preview"]
+        self.assertTrue(pv["trio_system"].strip())
+        self.assertTrue(pv["imposter_system"].strip())
+        for key in ("intro", "question", "answer", "vote"):
+            self.assertIn(key, pv["tasks"])
+
+
+def _engine_supports_no_imposter() -> bool:
+    try:
+        from imposter_game.config import RulesConfig
+        return hasattr(RulesConfig(), "no_imposter_chance")
+    except Exception:
+        return False
+
+
+@unittest.skipUnless(_engine_supports_no_imposter(), "engine has no no_imposter_chance yet")
+class NoImposterTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aau-test-noimp-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_imposter_game(self):
+        cfg = self.tmp / "config.toml"
+        cfg.write_text(_config_with_rules({"no_imposter_chance": 1.0}), encoding="utf-8")
+        c = GameController(cfg, mock=True, log_dir=self.tmp, mock_options={"delay": 0}, seed=5,
+                           prompts_dir=self.tmp / "prompts")
+        ok, msg = c.new_game()
+        self.assertTrue(ok, msg)
+        q, backlog = c.subscribe()
+        self.assertTrue(c.start("all")[0])
+        self.assertTrue(c.wait_idle(120))
+        events = list(backlog)
+        while not q.empty():
+            ev = q.get()
+            if ev and ev.get("type") != "status":
+                events.append(ev)
+        started = next(e for e in events if e["type"] == "game_started")
+        self.assertIs(started.get("has_imposter"), False)
+        self.assertTrue(all(p["role"] == "trio" for p in started["players"]))
+        over = events[-1]
+        self.assertEqual(over["type"], "game_over")
+        self.assertIn(over["outcome"], ("trio_win_no_imposter", "trio_loss_no_imposter"))
+        for v in (e for e in events if e["type"] == "vote_cast" and e.get("abstain_reason") == "nobody"):
+            self.assertIsNone(v["target"])
+        self.assertTrue(c.stats()["ok"])
 
 
 if __name__ == "__main__":

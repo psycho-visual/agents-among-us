@@ -353,7 +353,8 @@ class OpenRouterClient:
         return body
 
     def chat(self, model: str, messages: list[dict], reasoning_effort: str | None, max_tokens: int,
-             session_id: str | None = None) -> CallResult:
+             session_id: str | None = None, purpose: str | None = None, context: dict | None = None) -> CallResult:
+        """One chat completion. `purpose`/`context` are for the mock client and are ignored here."""
         if not messages or messages[-1].get("role") != "user":
             raise ValueError("messages must end with a user message")
         start = time.monotonic()
@@ -594,47 +595,44 @@ class MockClient:
         return random.Random(h.hexdigest())
 
     def chat(self, model: str, messages: list[dict], reasoning_effort: str | None, max_tokens: int,
-             session_id: str | None = None) -> CallResult:
+             session_id: str | None = None, purpose: str | None = None, context: dict | None = None) -> CallResult:
+        """Fake a reply. `purpose` ("intro", "question", "answer", "vote", "vote_retry", "paraphrase", ...)
+        and `context` (facts from the game engine) say what is being asked, so the mock never parses prompts."""
         start = time.monotonic()
         rng = self._rng(model, messages)
-        system = next((str(m.get("content", "")) for m in messages if m.get("role") == "system"), "")
+        ctx = context or {}
         last = str(messages[-1].get("content", "")) if messages else ""
-        m = re.search(r"Your name in this game is (\w+)\.", system)
-        me = m.group(1) if m else "Player"
-        imposter = prompts.IMPOSTER_LINE in system
-        no_names = "Nobody may mention" in system
+        me = ctx.get("player", "Player")
+        task = (purpose or "answer").replace("_retry_empty", "")
+        no_names = bool(ctx.get("no_names"))
 
-        markers = {prompts.TASK_INTRO: "intro", prompts.TASK_QUESTION: "question",
-                   prompts.TASK_ANSWER: "answer", prompts.TASK_VOTE: "vote"}
-        task, pos = "answer", -1
-        for marker, kind in markers.items():
-            i = last.rfind(marker)
-            if i > pos:
-                task, pos = kind, i
-
-        if task == "intro":
+        if task == "paraphrase":
+            content = mock_paraphrase(str(ctx.get("text", "")))
+        elif task == "intro":
             content = self._intro(rng, me, no_names)
         elif task == "question":
-            unused = [q for q in _MOCK_QUESTIONS if q not in last]   # don't repeat earlier questions
+            unused = [q for q in _MOCK_QUESTIONS if q not in last and mock_paraphrase(q) not in last]
             content = rng.choice(unused or _MOCK_QUESTIONS)
-        elif task == "vote":
-            content = self._vote(rng, me, last)
+        elif task in ("vote", "vote_retry"):
+            content = self._vote(rng, me, ctx, is_retry=task == "vote_retry")
         else:
-            content = self._answer(rng, last, no_names)
+            content = self._answer(rng, ctx, no_names)
 
-        role = "the imposter" if imposter else "a trio member"
+        role = "the imposter" if ctx.get("is_imposter") else "a trio member"
         reasoning = (f"[mock reasoning] I'm {me}, {role}. Task: {task}. "
                      f"{rng.choice(['Keep it natural.', 'Match the tone of the others.', 'Be specific but brief.', 'Stay consistent with my intro.'])}")
+        if task == "paraphrase":
+            reasoning = None
         lo, hi = self.delay
         if hi > 0:
-            time.sleep(rng.uniform(lo, hi))
+            time.sleep(rng.uniform(lo, hi) if task != "paraphrase" else rng.uniform(lo, hi) / 3)
 
         in_tok = max(1, sum(len(str(x.get("content", ""))) for x in messages) // 4)
-        r_tok = rng.randint(40, 600)
+        r_tok = 0 if task == "paraphrase" else rng.randint(40, 600)
         out_tok = r_tok + max(1, len(content) // 4)
         cached = int(in_tok * rng.uniform(0.5, 0.9)) if len(messages) and in_tok > 1200 else 0
         cost = (in_tok - cached) * self.PRICE_IN + cached * self.PRICE_IN * 0.1 + out_tok * self.PRICE_OUT
-        details = [{"type": "reasoning.text", "text": reasoning}]
+        details = [{"type": "reasoning.text", "text": reasoning}] if reasoning else None
         return CallResult(
             content=content, reasoning=reasoning, reasoning_details=details,
             input_tokens=in_tok, output_tokens=out_tok, reasoning_tokens=r_tok, cached_tokens=cached,
@@ -642,7 +640,7 @@ class MockClient:
             generation_id=f"mock-{rng.randrange(1 << 40):010x}", finish_reason="stop",
             latency_s=round(time.monotonic() - start, 3),
             raw_usage={"prompt_tokens": in_tok, "completion_tokens": out_tok, "mock": True},
-            reasoning_kind="text", cache_write_tokens=0, max_tokens_used=max_tokens,
+            reasoning_kind="text" if reasoning else "none", cache_write_tokens=0, max_tokens_used=max_tokens,
         )
 
     def _intro(self, rng: random.Random, me: str, no_names: bool) -> str:
@@ -653,17 +651,20 @@ class MockClient:
         elif rng.random() < 0.5:
             parts.append(f"For the record, I'm {rng.choice(_MOCK_MODEL_CLAIMS)}.")
         parts.append(rng.choice(_MOCK_CLOSERS))
-        return " ".join(parts)
+        text = " ".join(parts)
+        if rng.random() < 0.3:                       # some players use curly typography (normalized away)
+            text = text.replace("'", "\u2019").replace(" — ", " \u2014 ")
+        return text
 
-    def _answer(self, rng: random.Random, last: str, no_names: bool) -> str:
-        m = re.search(r"^Question from \w+: (.+)$", last, re.M)
-        question = m.group(1).strip() if m else ""
+    def _answer(self, rng: random.Random, ctx: dict, no_names: bool) -> str:
+        question = str(ctx.get("question", "")).strip()
+        question = _MOCK_PARAPHRASED_Q.get(question, question)
         text = rng.choice(_MOCK_QA.get(question, _MOCK_GENERIC_ANSWERS))
         if no_names and rng.random() < self.name_slip_rate / 2:
             text += " (My training at OpenAI taught me that.)"
         text += rng.choice(_MOCK_ANSWER_ENDS) if text[-1:] in ".!?" else ""
-        if prompts.CALL_VOTE_YES in last:          # vote calls are enabled: say whether we want a vote
-            rounds_seen = last.count("--- Round ")
+        if ctx.get("vote_calls"):                    # vote calls are enabled: say whether we want a vote
+            rounds_seen = int(ctx.get("rounds_completed") or 0)
             p_yes = min(0.5, 0.15 + 0.07 * rounds_seen)   # ~25% overall, more likely later on
             roll = rng.random()
             if roll < 0.03:
@@ -674,19 +675,34 @@ class MockClient:
                 text += "\n" + rng.choice([prompts.CALL_VOTE_NO, "call vote: no", "**CALL VOTE:** No."])
         return text
 
-    def _vote(self, rng: random.Random, me: str, last: str) -> str:
-        m = re.search(r"^Valid choices: (.+)$", last, re.M)
-        valid = [v.strip() for v in m.group(1).split(",")] if m else []
-        is_retry = "could not be counted" in last
+    def _vote(self, rng: random.Random, me: str, ctx: dict, is_retry: bool) -> str:
+        valid = list(ctx.get("valid_choices") or [])
         if not valid:
             return "I'm not sure who to vote for.\nVOTE: nobody"
-        # Players tend to converge on a shared "suspect" (derived from the public transcript,
+        if ctx.get("allow_nobody") and rng.random() < 0.2:
+            return f"Nothing stood out enough; maybe there is no imposter.\nVOTE: {prompts.NOBODY}"
+        # Players tend to converge on a shared "suspect" (derived from the public state,
         # which everyone sees identically) so mock votes are often decisive.
-        shared = last.split(prompts.TRANSCRIPT_END)[0]
         names = sorted(set(valid) | {me})
-        suspect = random.Random(hashlib.sha256(f"{self.seed}|{shared}".encode()).hexdigest()).choice(names)
+        key = f"{self.seed}|{ctx.get('public_key', '')}|{ctx.get('vote_number', '')}"
+        suspect = random.Random(hashlib.sha256(key.encode()).hexdigest()).choice(names)
         target = suspect if suspect in valid and rng.random() < 0.7 else rng.choice(valid)
         reason = rng.choice(_MOCK_VOTE_REASONS).format(t=target)
         if not is_retry and rng.random() < self.invalid_vote_rate:
-            return f"{reason} Actually, I'm torn.\nVOTE: {rng.choice([me, 'Nobody', 'Purple'])}"
+            return f"{reason} Actually, I'm torn.\nVOTE: {rng.choice([me, 'Purple'])}"
         return f"{reason}\nVOTE: {target}"
+
+
+_MOCK_CONTRACTIONS = [("I'm", "I am"), ("I'd", "I would"), ("don't", "do not"), ("it's", "it is"),
+                      ("It's", "It is"), ("What's", "What is"), ("you'd", "you would"), ("There's", "There is"),
+                      ("can't", "cannot"), ("I'll", "I will"), ("That's", "That is")]
+
+
+def mock_paraphrase(text: str) -> str:
+    """The mock 'paraphrase model': expands contractions and plain-ifies punctuation."""
+    for a, b in _MOCK_CONTRACTIONS:
+        text = text.replace(a, b).replace(a.replace("'", "\u2019"), b)
+    return text.replace(" \u2014 ", " - ").replace("!", ".").strip()
+
+
+_MOCK_PARAPHRASED_Q = {mock_paraphrase(q): q for q in _MOCK_QUESTIONS}

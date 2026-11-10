@@ -1,0 +1,7 @@
+=== YOUR TASK: INTRODUCTION ===
+The three trio members have already written their introductions (each wrote blind, without seeing the others). Only you can see them right now:
+
+{trio_intros}
+
+Now write your own introduction. All four introductions will be revealed to everyone together, in seat order, so nobody can tell from the order who wrote last.
+At most {word_limit} words. Reply with the introduction only.

@@ -60,6 +60,8 @@
   const OUTCOME_SHORT = {
     trio_win: "Trio wins!", imposter_win: "Imposter wins!", no_decision: "No decision",
     error: "Ended with an error", aborted: "Aborted",
+    trio_win_no_imposter: "No imposter, and the trio correctly voted nobody out",
+    trio_loss_no_imposter: "No imposter, but the trio voted out one of their own",
   };
 
   // ------------------------------------------------------------------ state
@@ -226,7 +228,30 @@
         (r.reveal_vote_calls === true ? ", requests public)" : ", requests secret)"));
     }
     if (r.on_no_decision) rules.push(r.on_no_decision === "continue" ? `keep going if undecided (max ${r.max_rounds} rounds)` : "ends if undecided");
+    if (typeof r.no_imposter_chance === "number" && r.no_imposter_chance > 0) {
+      rules.push(`${Math.round(r.no_imposter_chance * 100)}% chance of no imposter`);
+    }
+    if (r.intro_word_limit) rules.push(`intros ≤ ${r.intro_word_limit} words`);
     if (rules.length) parts.push(el("div", null, el("b", null, "Rules: "), rules.join(" · ")));
+    // Fairness settings: what is done to text before other players see it, and what the imposter is told.
+    const fair = [];
+    if (r.normalize_typography === true) fair.push("typography normalised (straight quotes, no markdown)");
+    const para = c.paraphrase || r.paraphrase;
+    if (para && para.enabled) fair.push(`messages paraphrased by ${para.model || "a neutral model"}`);
+    if (typeof r.imposter_knows_own_model === "boolean") {
+      fair.push(r.imposter_knows_own_model ? "imposter is told its own model" : "imposter is not told its own model");
+    }
+    if (fair.length) parts.push(el("div", null, el("b", null, "Fairness: "), fair.join(" · ")));
+    const pv = S.promptVersion ?? c.prompt_version;
+    if (pv) {
+      const mod = S.promptsModified ?? c.prompts_modified;
+      parts.push(el("div", null, el("b", null, "Prompts: "), `version ${pv} `,
+        mod ? el("span", { class: "chip chip-edited", title: "Some prompt templates were edited (prompts/ folder)" }, "customised") : " (defaults)"));
+    }
+    if (S.hasImposter === false) {
+      parts.push(el("div", { class: "role-info no-imp-note" }, "🎲 This game has no imposter: all four players are ",
+        trio.display_name || trio.model || "the trio model", "."));
+    }
     $("settings").replaceChildren(...parts);
   }
 
@@ -272,17 +297,28 @@
       last.model ? el("span", { class: "role-info" }, " · " + last.model) : null);
   }
 
-  function registerCallTarget(callId, costSlot, chipSlot) {
+  function registerCallTarget(callId, costSlot, chipSlot, compact) {
     if (!callId) return;
-    (S.callTargets[callId] = S.callTargets[callId] || []).push({ costSlot, chipSlot });
+    (S.callTargets[callId] = S.callTargets[callId] || []).push({ costSlot, chipSlot, compact: !!compact });
     fillCallTargets(callId);
   }
   function fillCallTargets(callId) {
     for (const t of S.callTargets[callId] || []) {
-      const line = callLine(callId);
+      const line = t.compact ? paraphraseLine(callId) : callLine(callId);
       t.costSlot.replaceChildren(...(line ? [line] : []));
-      t.chipSlot.replaceChildren(...(S.violations[callId] || []).map(violationChip));
+      if (t.chipSlot) t.chipSlot.replaceChildren(...(S.violations[callId] || []).map(violationChip));
     }
+  }
+  function paraphraseLine(callId) {
+    const evs = S.calls[callId];
+    if (!evs || !evs.length) return null;
+    let cost = 0, known = false, inT = 0, outT = 0;
+    for (const e of evs) {
+      if (typeof e.cost_usd === "number") { cost += e.cost_usd; known = true; }
+      inT += e.input_tokens || 0; outT += e.output_tokens || 0;
+    }
+    return el("span", { class: "call-line", title: `paraphrase call ${callId}: ${fmtInt(inT)} in · ${fmtInt(outT)} out · ${evs[0].model || ""}` },
+      `+ paraphrase ${known ? fmtUSD(cost) : "cost n/a"}`);
   }
   function violationChip(v) {
     const matches = Array.isArray(v.matches) ? v.matches.join(", ") : "";
@@ -333,13 +369,17 @@
 
   // The engine strips the "CALL VOTE: YES/NO" line from public text; that alone is not a redaction.
   const CALL_VOTE_LINE = /^[\s*_>#`-]*call[\s*_]*vote\b.*$/gim;
-  function originalDiffers(ev) {
-    if (ev.original_text == null || ev.original_text === ev.text) return false;
+  // Returns the list of changes made to the text before players saw it (null = nothing worth showing).
+  function originalChanges(ev) {
+    if (ev.original_text == null || ev.original_text === ev.text) return null;
+    if (Array.isArray(ev.transforms)) return ev.transforms.length ? ev.transforms.map(String) : null;
     const norm = (t) => String(t ?? "").replace(CALL_VOTE_LINE, "").replace(/\s+/g, " ").trim();
-    return norm(ev.original_text) !== norm(ev.text);
+    return norm(ev.original_text) !== norm(ev.text) ? ["redacted"] : null; // older engines: only redaction
   }
 
   function messageEl(ev) {
+    const changes = originalChanges(ev);
+    const paraSlot = el("span", { class: "cost-slot para-slot" });
     const costSlot = el("span", { class: "cost-slot" });
     const chipSlot = el("span", { class: "chip-slot" });
     const verb = { intro: "introduces themself", question: "asks", answer: "answers" }[ev.kind] || ev.kind;
@@ -347,12 +387,18 @@
       el("div", { class: "msg-head" }, nameTag(ev.player), el("span", { class: "muted small verb" }, verb), wantsVoteChip(ev), chipSlot,
         el("span", { class: "spacer" }), costSlot),
       el("div", { class: "msg-text pre" }, ev.text == null ? "" : String(ev.text)),
-      originalDiffers(ev)
-        ? el("details", { class: "original" }, el("summary", null, "Original text (before redaction)"),
+      changes
+        ? el("details", { class: "original" },
+          el("summary", null, `Original text (${changes.join(", ")})`,
+            el("span", { class: "muted small" }, " · what the model actually wrote; other players saw the text above")),
           el("div", { class: "pre" }, String(ev.original_text)))
         : null,
       reasoningBlock(ev.reasoning));
     registerCallTarget(ev.call_id, costSlot, chipSlot);
+    if (ev.paraphrase_call_id) {
+      costSlot.after(paraSlot);
+      registerCallTarget(ev.paraphrase_call_id, paraSlot, null, true);
+    }
     return node;
   }
 
@@ -380,6 +426,9 @@
     game_started(ev) {
       if (typeof ev.mock === "boolean") S.mock = ev.mock;
       S.config = ev.config || null;
+      S.hasImposter = typeof ev.has_imposter === "boolean" ? ev.has_imposter : null;
+      S.promptVersion = ev.prompt_version ?? (S.config && S.config.prompt_version) ?? null;
+      S.promptsModified = ev.prompts_modified ?? (S.config && S.config.prompts_modified) ?? null;
       const ps = Array.isArray(ev.players) ? ev.players.slice() : [];
       ps.sort((a, b) => (a.seat ?? 0) - (b.seat ?? 0));
       S.order = ps.map((p) => p.name);
@@ -447,7 +496,9 @@
       const chipSlot = el("span", { class: "chip-slot" });
       const node = el("div", { class: "ballot", style: { "--seat": seatColor(ev.player) } },
         el("div", { class: "msg-head" }, nameTag(ev.player), el("span", { class: "arrow" }, "votes for"),
-          ev.target ? nameTag(ev.target) : el("span", { class: "chip chip-abstain" }, "abstains"),
+          ev.target ? nameTag(ev.target)
+            : ev.abstain_reason === "nobody" ? el("span", { class: "chip chip-nobody", title: "Voted that there is no imposter in this game (counts as an abstention)" }, "nobody")
+              : el("span", { class: "chip chip-abstain" }, "abstains"),
           ev.valid === false ? el("span", { class: "chip chip-warn", title: "The vote was invalid (even after one retry) and counts as an abstention" }, "invalid vote") : null,
           chipSlot, el("span", { class: "spacer" }), costSlot),
         ev.raw_text ? el("div", null,
@@ -496,6 +547,8 @@
       switch (ev.decision) {
         case "trio_win": headline = [nameTag(elim), " was voted out — and was the imposter! The trio wins."]; cls = "good"; break;
         case "imposter_win": headline = [nameTag(elim), " was voted out — but was a trio member. The imposter wins!"]; cls = "bad"; break;
+        case "trio_win_no_imposter": headline = ["Nobody was voted out — and there was no imposter this game. The trio wins!"]; cls = "good"; break;
+        case "trio_loss_no_imposter": headline = [nameTag(elim), " was voted out — but there was no imposter this game. The trio voted out one of their own copies."]; cls = "bad"; break;
         case "continue": headline = [`Nobody reached ${thr} votes — ${isCalled(ev.trigger || vb.trigger) ? "the called vote failed, " : ""}the game continues.`]; cls = "neutral"; break;
         case "no_decision": headline = [`Nobody reached ${thr} votes — no decision.`]; cls = "neutral"; break;
         default: headline = [elim ? [nameTag(elim), ` was voted out (${role || "unknown role"}).`] : "No one was voted out."]; cls = "neutral";
@@ -526,8 +579,10 @@
       t.inTok = typeof ev.total_input_tokens === "number" ? ev.total_input_tokens : t.inTok + (ev.input_tokens || 0);
       t.outTok = typeof ev.total_output_tokens === "number" ? ev.total_output_tokens : t.outTok + (ev.output_tokens || 0);
       const p = S.players[ev.player];
-      const model = (p && p.model) || ev.model || "unknown";
-      const m = (t.byModel[model] = t.byModel[model] || { cost: 0, calls: 0, role: p ? (p.role === "imposter" ? "imposter" : "trio") : null });
+      const para = ev.purpose === "paraphrase";
+      const model = para ? (ev.model || "paraphraser") : ((p && p.model) || ev.model || "unknown");
+      const role = para ? "paraphrase" : p ? (p.role === "imposter" ? "imposter" : "trio") : null;
+      const m = (t.byModel[model] = t.byModel[model] || { cost: 0, calls: 0, role });
       m.cost += ev.cost_usd || 0;
       m.calls += 1;
       fillCallTargets(ev.call_id);
@@ -572,8 +627,13 @@
     const titles = {
       trio_win: "The trio wins! 🎉", imposter_win: "The imposter wins! 🕵️", no_decision: "No decision 🤷",
       error: "Game ended with an error", aborted: "Game aborted",
+      trio_win_no_imposter: "No imposter this game — the trio correctly voted nobody out 🎉",
+      trio_loss_no_imposter: "No imposter this game — the trio voted out one of their own copies",
     };
-    const cls = { trio_win: "good", imposter_win: "bad", error: "err", aborted: "err" }[ev.outcome] || "neutral";
+    const cls = { trio_win: "good", imposter_win: "bad", error: "err", aborted: "err",
+      trio_win_no_imposter: "good", trio_loss_no_imposter: "bad" }[ev.outcome] || "neutral";
+    const noImposter = ev.has_imposter === false || S.hasImposter === false ||
+      ev.outcome === "trio_win_no_imposter" || ev.outcome === "trio_loss_no_imposter";
     const rows = [];
     if (ev.eliminated) {
       const ep = S.players[ev.eliminated] || {};
@@ -582,7 +642,10 @@
     } else {
       rows.push(["Voted out", "nobody"]);
     }
-    if (ip) rows.push(["The imposter was", [nameTag(imposter), ` — ${ip.display_name || ip.model || ""}${ip.reasoning_effort ? ` (effort ${ip.reasoning_effort})` : ""}`]]);
+    if (noImposter) {
+      const anyP = S.players[S.order[0]] || {};
+      rows.push(["The imposter was", `nobody — all four players were ${anyP.display_name || anyP.model || "the trio model"}`]);
+    } else if (ip) rows.push(["The imposter was", [nameTag(imposter), ` — ${ip.display_name || ip.model || ""}${ip.reasoning_effort ? ` (effort ${ip.reasoning_effort})` : ""}`]]);
     if (ev.rounds_completed != null) rows.push(["Rounds played", String(ev.rounds_completed) + (ev.turns_completed != null ? ` (${plural(ev.turns_completed, "question turn")})` : "")]);
     else if (ev.turns_completed != null) rows.push(["Question turns", String(ev.turns_completed)]);
     const nVotes = Object.keys(S.votes).length;
@@ -841,6 +904,30 @@
             el("th", null, p.trio_model, el("span", { class: "muted" }, " vs "), p.imposter_model),
             el("td", null, fmtInt(p.games)), el("td", null, fmtInt(p.trio_wins ?? 0)),
             el("td", null, fmtInt(p.imposter_wins ?? 0)), el("td", null, fmtInt(p.no_decision ?? 0)))))))));
+    }
+    const ni = st.no_imposter;
+    if (isObj(ni)) {
+      used.add("no_imposter");
+      if (ni.games) {
+        out.push(el("div", { class: "stats-section" }, el("h3", null, "No-imposter games"),
+          el("dl", { class: "kv" },
+            el("dt", null, "Games"), el("dd", null, fmtInt(ni.games)),
+            el("dt", null, "Trio correctly voted nobody out"), el("dd", null, fmtInt(ni.trio_wins ?? 0)),
+            el("dt", null, "Voted out one of their own"), el("dd", null, `${fmtInt(ni.false_eliminations ?? 0)} (${pct(ni.false_elimination_rate)})`))));
+      }
+    }
+    const bv = st.by_prompt_version;
+    if (Array.isArray(bv) && bv.length && bv.every(isObj)) {
+      used.add("by_prompt_version");
+      out.push(el("div", { class: "stats-section" }, el("h3", null, "By prompt version"),
+        el("div", { class: "table-wrap" }, el("table", { class: "stats-table" },
+          el("thead", null, el("tr", null, el("th", null, "Version"), el("th", null, "Games"),
+            el("th", { title: "imposter caught / decisive games" }, "Caught"), el("th", { title: "games with no imposter" }, "No imp."))),
+          el("tbody", null, bv.map((d) => el("tr", null,
+            el("th", null, String(d.prompt_version ?? "?"), d.modified ? el("span", { class: "muted" }, " (edited)") : null),
+            el("td", null, fmtInt(d.games)),
+            el("td", null, d.decisive_games ? `${d.caught ?? 0}/${d.decisive_games} (${pct(d.catch_rate)})` : "—"),
+            el("td", null, fmtInt(d.no_imposter_games ?? 0)))))))));
     }
     const rest = Object.entries(st).filter(([k]) => !used.has(k));
     if (rest.length) {

@@ -66,12 +66,15 @@ class RulesConfig:
     reveal_votes: bool = True
     player_names: list[str] = field(default_factory=lambda: ["Red", "Blue", "Green", "Yellow"])
     shuffle_seats: bool = True
-    intro_word_limit: int = 80
+    intro_word_limit: int = 40
     question_word_limit: int = 40
     answer_word_limit: int = 100
     player_vote_calls: bool = True      # players may call a vote (see config.toml)
     vote_call_threshold: int = 3        # requests needed in one turn to call a vote
     reveal_vote_calls: bool = False     # show who requested a vote in the public transcript
+    imposter_knows_own_model: bool = True   # tell the imposter its own model name
+    normalize_typography: bool = True       # straighten quotes/dashes, strip markdown in public text
+    no_imposter_chance: float = 0.0         # probability that a game has no imposter at all
 
 
 @dataclass
@@ -85,11 +88,20 @@ class ApiConfig:
 
 
 @dataclass
+class ParaphraseConfig:
+    enabled: bool = False
+    model: str = "mistralai/mistral-small-3.2-24b-instruct"
+    reasoning_effort: str | None = None
+    max_output_tokens: int = 1000
+
+
+@dataclass
 class GameConfig:
     trio: ModelConfig
     imposter: ModelConfig
     rules: RulesConfig = field(default_factory=RulesConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
+    paraphrase: ParaphraseConfig = field(default_factory=ParaphraseConfig)
     api_key: str | None = field(default=None, repr=False)
     source_path: str | None = None
 
@@ -105,6 +117,7 @@ class GameConfig:
             "imposter": asdict(self.imposter),
             "rules": asdict(self.rules),
             "api": asdict(self.api),
+            "paraphrase": asdict(self.paraphrase),
             "source_path": self.source_path,
         }
 
@@ -226,7 +239,12 @@ def _rules_section(table: dict, file: str) -> RulesConfig:
         player_vote_calls=_get(table, "player_vote_calls", d.player_vote_calls, where, bool),
         vote_call_threshold=_get(table, "vote_call_threshold", d.vote_call_threshold, where, int),
         reveal_vote_calls=_get(table, "reveal_vote_calls", d.reveal_vote_calls, where, bool),
+        imposter_knows_own_model=_get(table, "imposter_knows_own_model", d.imposter_knows_own_model, where, bool),
+        normalize_typography=_get(table, "normalize_typography", d.normalize_typography, where, bool),
+        no_imposter_chance=_get(table, "no_imposter_chance", d.no_imposter_chance, where, float),
     )
+    if not 0.0 <= r.no_imposter_chance <= 1.0:
+        raise ConfigError(f"{where} no_imposter_chance must be between 0.0 and 1.0 (got {r.no_imposter_chance})")
     names = [str(n).strip() for n in r.player_names]
     if len(names) != 4 or not all(names):
         raise ConfigError(f"{where} player_names must list exactly 4 names (got {r.player_names!r})")
@@ -250,6 +268,25 @@ def _rules_section(table: dict, file: str) -> RulesConfig:
         if getattr(r, key) < 5:
             raise ConfigError(f"{where} {key} must be at least 5 (got {getattr(r, key)})")
     return r
+
+
+def _paraphrase_section(table: dict, file: str) -> ParaphraseConfig:
+    where = f"{file}: [paraphrase]"
+    d = ParaphraseConfig()
+    effort = _get(table, "reasoning_effort", "", where, str).strip().lower()
+    if effort:
+        _choice(effort, REASONING_EFFORTS, where, "reasoning_effort")
+    p = ParaphraseConfig(
+        enabled=_get(table, "enabled", d.enabled, where, bool),
+        model=_get(table, "model", d.model, where, str).strip(),
+        reasoning_effort=effort or None,
+        max_output_tokens=_get(table, "max_output_tokens", d.max_output_tokens, where, int),
+    )
+    if p.enabled and not p.model:
+        raise ConfigError(f'{where} model is required when enabled = true')
+    if p.max_output_tokens < 16:
+        raise ConfigError(f"{where} max_output_tokens is too small (got {p.max_output_tokens})")
+    return p
 
 
 def _api_section(table: dict, file: str) -> ApiConfig:
@@ -286,6 +323,7 @@ def config_from_dict(data: dict, file: str = "config", api_key: str | None = Non
         imposter=_model_section(data, "imposter", file),
         rules=_rules_section(data.get("rules", {}) or {}, file),
         api=_api_section(data.get("api", {}) or {}, file),
+        paraphrase=_paraphrase_section(data.get("paraphrase", {}) or {}, file),
         api_key=api_key,
     )
     return cfg

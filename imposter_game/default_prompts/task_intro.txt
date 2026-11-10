@@ -1,0 +1,4 @@
+=== YOUR TASK: INTRODUCTION ===
+Write your introduction for the other players. {intro_timing}
+Introduce yourself however you think best serves your goal.
+At most {word_limit} words. Reply with the introduction only.

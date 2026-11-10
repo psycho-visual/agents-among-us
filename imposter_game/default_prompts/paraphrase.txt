@@ -1,0 +1,7 @@
+Rewrite the message below in plain, neutral English, as if a careful editor had retyped it.
+Keep the meaning, every specific detail and number, any quoted words, any names, and roughly the same length. Keep a question as a question and an answer as an answer. Do not add, remove or soften ideas, do not reply to the message, and do not mention that it was rewritten.
+Use straight quotes and simple punctuation, and no markdown.
+Reply with the rewritten message only.
+
+MESSAGE:
+{text}

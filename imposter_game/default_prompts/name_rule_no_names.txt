@@ -1,0 +1,1 @@
+NAME RULE: Nobody may mention any AI model name, model family, or AI company name (for example Claude, GPT, Gemini, Llama, Grok, Anthropic, OpenAI, Google, Meta...) in anything said publicly — including your own. Violations are detected automatically {redaction}

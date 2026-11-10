@@ -15,13 +15,15 @@ of this file:
     decide_after_vote(...)                  does the game end, and who won?
     parse_vote(text, me, names)             reading "VOTE: <Name>" from a reply
     find_name_violations / redact_names     the "no_names" rule
+    normalize_typography                    straight quotes, plain dashes, no markdown
     clean_reply / limit_words               tidying model output
 
-All the words the models see are in prompts.py.
+All the words the models see come from editable templates (see prompts.py).
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 import random
 import re
@@ -36,9 +38,10 @@ from typing import Callable
 
 from . import prompts
 from .config import GameConfig
+from .prompts import NOBODY, PromptSet
 from .logger import GameLogger, render_markdown
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # =============================================================================
@@ -106,12 +109,18 @@ def vote_label(number: int, trigger: str) -> str:
 
 
 def decide_after_vote(eliminated_role: str | None, rounds_completed: int, rules,
-                      trigger: str = "scheduled") -> str:
-    """'trio_win' | 'imposter_win' | 'no_decision' (game ends) | 'continue' (play on).
+                      trigger: str = "scheduled", has_imposter: bool = True) -> str:
+    """What happens after a vote.
 
+    Returns 'continue' (play on) or a final outcome:
+      imposter game:    'trio_win' | 'imposter_win' | 'no_decision'
+      no-imposter game: 'trio_loss_no_imposter' (a copy was voted out) |
+                        'trio_win_no_imposter' (the game ended with nobody voted out)
     A failed CALLED vote always continues. Scheduled (and merged called+scheduled)
     votes follow `on_no_decision`.
     """
+    if not has_imposter and eliminated_role is not None:
+        return "trio_loss_no_imposter"
     if eliminated_role == "imposter":
         return "trio_win"
     if eliminated_role == "trio":
@@ -120,14 +129,31 @@ def decide_after_vote(eliminated_role: str | None, rounds_completed: int, rules,
         return "continue"
     if rules.on_no_decision == "continue" and rounds_completed < rules.max_rounds:
         return "continue"
-    return "no_decision"
+    return "no_decision" if has_imposter else "trio_win_no_imposter"
+
+
+WINNER_OF = {"trio_win": "trio", "imposter_win": "imposter", "trio_win_no_imposter": "trio"}
+
+
+def decide_has_imposter(rng: random.Random, rules) -> bool:
+    """Roll whether this game has an imposter (no_imposter_chance). Uses no randomness when the chance is 0."""
+    chance = float(getattr(rules, "no_imposter_chance", 0.0) or 0.0)
+    if chance <= 0:
+        return True
+    return not (rng.random() < chance)
 
 
 _VOTE_RE = re.compile(r"^[\s>*_`#-]*vote\s*[:：]\s*(.*)$", re.IGNORECASE)
 
 
-def parse_vote(text: str, me: str, names: list[str]) -> tuple[str | None, str | None]:
-    """Read the LAST 'VOTE: <Name>' line. Returns (target, None) or (None, problem)."""
+_NOBODY_WORDS = {"nobody", "none", "no one", "no-one", "noone"}
+
+
+def parse_vote(text: str, me: str, names: list[str], allow_nobody: bool = False) -> tuple[str | None, str | None]:
+    """Read the LAST 'VOTE: <Name>' line. Returns (target, None) or (None, problem).
+
+    With allow_nobody, 'VOTE: NOBODY' returns (prompts.NOBODY, None).
+    """
     lines = (text or "").splitlines()
     for line in reversed(lines):
         m = _VOTE_RE.match(line)
@@ -135,6 +161,8 @@ def parse_vote(text: str, me: str, names: list[str]) -> tuple[str | None, str | 
             continue
         raw = m.group(1).strip().strip("*_`\"'[]()<>.,!;: ").strip()
         word = raw.split()[0].strip("*_`\"'[]()<>.,!;:") if raw else ""
+        if allow_nobody and (word.lower() in _NOBODY_WORDS or raw.lower() in _NOBODY_WORDS):
+            return NOBODY, None
         for n in names:
             if word.lower() == n.lower() or raw.lower() == n.lower():
                 if n == me:
@@ -222,6 +250,40 @@ def clean_reply(text: str, names: list[str]) -> str:
     return text
 
 
+_TYPO_TABLE = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u2033": '"',
+    "\u00ab": '"', "\u00bb": '"',
+    "\u2026": "...",
+    "\u00a0": " ", "\u2002": " ", "\u2003": " ", "\u2004": " ", "\u2005": " ", "\u2006": " ",
+    "\u2007": " ", "\u2008": " ", "\u2009": " ", "\u200a": " ", "\u202f": " ", "\u205f": " ",
+    "\u200b": None, "\u200c": None, "\u200d": None, "\u2060": None, "\ufeff": None,
+})
+_DASHES = "\u2012\u2013\u2014\u2015\u2212"
+
+
+def normalize_typography(text: str) -> str:
+    """Make typography uniform so it can't give a model away.
+
+    Curly quotes -> straight, long dashes -> " - " (but "1–10" -> "1-10"), "…" -> "...",
+    odd spaces -> normal/removed, markdown emphasis/headings/bullets stripped. Line breaks kept.
+    """
+    t = (text or "").translate(_TYPO_TABLE)
+    t = re.sub(rf"(?<=\d)[ \t]*[{_DASHES}][ \t]*(?=\d)", "-", t)
+    t = re.sub(rf"[ \t]*[{_DASHES}][ \t]*", " - ", t)
+    out = []
+    for line in t.split("\n"):
+        line = re.sub(r"^[ \t]*#{1,6}[ \t]+", "", line)                 # markdown headings
+        line = re.sub(r"^[ \t]*(?:[-*\u2022])[ \t]+", "", line)          # bullet markers
+        line = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"\1", line)          # **bold**
+        line = re.sub(r"__(?=\S)(.+?)(?<=\S)__", r"\1", line)              # __bold__
+        line = re.sub(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])", r"\1", line)   # *italic*
+        line = re.sub(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])", r"\1", line)      # _italic_
+        line = re.sub(r"[ \t]{2,}", " ", line).strip()
+        out.append(line)
+    return "\n".join(out).strip()
+
+
 def limit_words(text: str, limit: int, factor: float = 2.0) -> str:
     """Cut text that is far over its word limit (more than factor x limit)."""
     words = text.split()
@@ -258,6 +320,15 @@ class PlayerCallError(Exception):
         self.error = error
 
 
+def _accepts_kwarg(client, name: str) -> bool:
+    """Does client.chat accept `name=` (or **kwargs)? Old/fake clients may not."""
+    try:
+        params = inspect.signature(client.chat).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
 
@@ -270,7 +341,8 @@ class Game:
     """One game, advanced one step at a time. See module docstring."""
 
     def __init__(self, cfg: GameConfig, client, on_event: Callable[[dict], None] | None = None,
-                 log_dir: Path = Path("logs"), mock: bool = False, seed: int | None = None):
+                 log_dir: Path = Path("logs"), mock: bool = False, seed: int | None = None,
+                 prompts_dir: str | Path | None = None, templates: dict[str, str] | None = None):
         self.cfg = cfg
         self.rules = cfg.rules
         self.client = client
@@ -302,20 +374,27 @@ class Game:
         self.reasoning_returned: dict[str, bool] = {}
         self.cost_sources: set[str] = set()
 
-        # Seats
+        # Prompt templates: loaded once, here (edits apply to the next game).
+        self.prompts = PromptSet(templates, prompts_dir=prompts_dir)
+        self._client_takes_context = _accepts_kwarg(client, "purpose")
+
+        # Seats (and whether there is an imposter at all)
         names = list(self.rules.player_names)
         rng = random.Random(seed)
         imp_index = rng.randrange(len(names)) if self.rules.shuffle_seats else len(names) - 1
+        self.has_imposter = decide_has_imposter(rng, self.rules)
+        self.allow_nobody = float(self.rules.no_imposter_chance or 0) > 0
         self.players: list[Player] = []
         for i, name in enumerate(names):
-            m = cfg.imposter if i == imp_index else cfg.trio
-            role = "imposter" if i == imp_index else "trio"
+            is_imp = self.has_imposter and i == imp_index
+            m = cfg.imposter if is_imp else cfg.trio
+            role = "imposter" if is_imp else "trio"
             p = Player(name=name, seat=i + 1, role=role, model=m.model, display_name=m.display_name,
                        reasoning_effort=m.reasoning_effort, max_tokens=cfg.max_tokens_for(role))
-            p.system_prompt = prompts.system_prompt(name, role, m.display_name, self.rules, names)
+            p.system_prompt = self.prompts.system_prompt(name, role, m.display_name, self.rules, names)
             self.players.append(p)
         self.by_name = {p.name: p for p in self.players}
-        self.imposter = self.players[imp_index]
+        self.imposter: Player | None = self.players[imp_index] if self.has_imposter else None
         self.name_terms = build_name_terms(cfg)
 
         # Progress state
@@ -343,7 +422,10 @@ class Game:
         self._own_votes: dict[str, list[tuple[int, str | None]]] = {p.name: [] for p in self.players}
 
         self._emit("game_started", mock=mock, config=self._config_summary(),
-                   players=[p.public_dict() for p in self.players])
+                   players=[p.public_dict() for p in self.players], has_imposter=self.has_imposter,
+                   prompt_version=self.prompts.version, prompts_modified=self.prompts.modified)
+        for w in self.prompts.warnings:
+            self._emit("error", message=w, fatal=False, player=None)
         # Log files are only created once the first step() runs, so a game that
         # is created but never played leaves nothing on disk.
 
@@ -404,7 +486,10 @@ class Game:
             return event
 
     def _config_summary(self) -> dict:
-        return self.cfg.summary()
+        s = self.cfg.summary()
+        s["prompt_version"] = self.prompts.version
+        s["prompts_modified"] = self.prompts.modified
+        return s
 
     def _set_state(self, state: str) -> None:
         """Move to the next phase, unless the game was ended meanwhile (e.g. aborted)."""
@@ -420,30 +505,51 @@ class Game:
         return [{"role": "system", "content": player.system_prompt},
                 {"role": "user", "content": prompts.user_message(transcript, task, notes)}]
 
-    def _call(self, player: Player, purpose: str, messages: list[dict], round_no: int | None):
+    def _context(self, player: Player, **extra) -> dict:
+        """Facts about a call for the mock client (so it never has to parse prompt text)."""
+        ctx = {"player": player.name, "is_imposter": player.role == "imposter",
+               "seat_names": [p.name for p in self.players], "no_names": self.rules.name_rule == "no_names",
+               "vote_calls": self.rules.player_vote_calls, "allow_nobody": self.allow_nobody,
+               "round": self.round, "rounds_completed": self.rounds_completed,
+               "public_key": f"{len(self._intros)}|{len(self._entries)}|"
+                             f"{sum(len(e.get('answers', [])) for e in self._entries)}|{self.vote_number}"}
+        ctx.update(extra)
+        return ctx
+
+    def _call(self, player: Player, purpose: str, messages: list[dict], round_no: int | None,
+              context: dict | None = None, model: str | None = None, effort: str | None = None,
+              max_tokens: int | None = None, session: str | None = None, is_paraphrase: bool = False):
         """One model call: run it, record it, emit api_call. Returns (CallResult, call_id)."""
+        model = model or player.model
+        effort = effort if is_paraphrase else player.reasoning_effort
+        max_tokens = max_tokens or player.max_tokens
         with self._lock:
             self._call_counter += 1
             call_id = f"c{self._call_counter:04d}"
+        kwargs = {"session_id": session or f"{self.game_id}-{player.name}"}
+        if self._client_takes_context:
+            kwargs["purpose"] = purpose
+            kwargs["context"] = context if context is not None else self._context(player)
         try:
-            res = self.client.chat(player.model, messages, player.reasoning_effort, player.max_tokens,
-                                   session_id=f"{self.game_id}-{player.name}")
+            res = self.client.chat(model, messages, effort, max_tokens, **kwargs)
         except Exception as e:
             with self._lock:
                 self.calls.append({"call_id": call_id, "player": player.name, "purpose": purpose,
-                                   "round": round_no, "model_requested": player.model,
+                                   "round": round_no, "model_requested": model,
                                    "user_message": messages[-1]["content"], "error": str(e)})
             raise PlayerCallError(player.name, purpose, e) from e
 
         reasoning_available = bool(res.reasoning and res.reasoning.strip())
+        user_idx = 0 if is_paraphrase else 1
         with self._lock:
             self.calls.append({
-                "call_id": call_id, "player": player.name, "role": player.role, "purpose": purpose,
-                "round": round_no, "model_requested": player.model, "model": res.model,
-                "provider": res.provider, "reasoning_effort": player.reasoning_effort,
-                "max_tokens": player.max_tokens, "max_tokens_used": res.max_tokens_used,
-                "user_message": messages[1]["content"] if len(messages) > 1 else None,
-                "extra_messages": messages[2:] if len(messages) > 2 else None,
+                "call_id": call_id, "player": player.name, "role": "paraphraser" if is_paraphrase else player.role,
+                "purpose": purpose,
+                "round": round_no, "model_requested": model, "model": res.model,
+                "provider": res.provider, "reasoning_effort": effort,
+                "max_tokens": max_tokens, "max_tokens_used": res.max_tokens_used,
+                "user_message": messages[user_idx]["content"] if len(messages) > user_idx else None,
+                "extra_messages": messages[user_idx + 1:] if len(messages) > user_idx + 1 else None,
                 "content": res.content, "reasoning": res.reasoning, "reasoning_kind": res.reasoning_kind,
                 "reasoning_details": res.reasoning_details, "refusal": res.refusal,
                 "input_tokens": res.input_tokens, "output_tokens": res.output_tokens,
@@ -456,8 +562,9 @@ class Game:
             self.total_cost_usd += res.cost_usd or 0.0
             self.total_input_tokens += res.input_tokens or 0
             self.total_output_tokens += res.output_tokens or 0
-            self.cost_by_model[player.model] = self.cost_by_model.get(player.model, 0.0) + (res.cost_usd or 0.0)
-            self.reasoning_returned[player.model] = self.reasoning_returned.get(player.model, False) or reasoning_available
+            self.cost_by_model[model] = self.cost_by_model.get(model, 0.0) + (res.cost_usd or 0.0)
+            if not is_paraphrase:
+                self.reasoning_returned[model] = self.reasoning_returned.get(model, False) or reasoning_available
             self.cost_sources.add(res.cost_source)
             self._emit("api_call", call_id=call_id, player=player.name, model=res.model, purpose=purpose,
                        input_tokens=res.input_tokens, output_tokens=res.output_tokens,
@@ -469,14 +576,15 @@ class Game:
                        finish_reason=res.finish_reason, round=round_no, notes=list(res.notes))
         return res, call_id
 
-    def _call_text(self, player: Player, purpose: str, task: str, round_no: int | None):
+    def _call_text(self, player: Player, purpose: str, task: str, round_no: int | None, **ctx):
         """A call whose reply is public text. Retries once if the reply is empty."""
         messages = self._messages(player, task)
-        res, call_id = self._call(player, purpose, messages, round_no)
+        context = self._context(player, **ctx)
+        res, call_id = self._call(player, purpose, messages, round_no, context=context)
         if not (res.content or "").strip():
             retry = messages + [{"role": "assistant", "content": "(no reply)"},
-                                {"role": "user", "content": prompts.empty_reply_retry_message()}]
-            res, call_id = self._call(player, purpose + "_retry_empty", retry, round_no)
+                                {"role": "user", "content": self.prompts.empty_reply_retry_message()}]
+            res, call_id = self._call(player, purpose + "_retry_empty", retry, round_no, context=context)
         return res, call_id
 
     def _annotate_call(self, call_id: str, **fields) -> None:
@@ -487,18 +595,64 @@ class Game:
                     c.update(fields)
                     return
 
-    def _public_text(self, player: Player, raw: str, call_id: str, word_limit: int) -> tuple[str, str]:
-        """(text shown to players, original text). Applies cleanup and the name rule."""
+    def _paraphrase(self, player: Player, text: str, round_no: int | None) -> tuple[str | None, str | None]:
+        """Rewrite text with the [paraphrase] model. Returns (new_text, call_id) or (None, None) on failure."""
+        pcfg = self.cfg.paraphrase
+        messages = [{"role": "user", "content": self.prompts.paraphrase_request(text)}]
+        try:
+            res, call_id = self._call(player, "paraphrase", messages, round_no,
+                                      context=self._context(player, text=text), model=pcfg.model,
+                                      effort=pcfg.reasoning_effort, max_tokens=pcfg.max_output_tokens,
+                                      session=f"{self.game_id}-paraphrase", is_paraphrase=True)
+        except PlayerCallError as e:
+            self._emit("error", message=f"Paraphrase failed, showing the original text instead: {e.error}",
+                       fatal=False, player=player.name)
+            return None, None
+        new = (res.content or "").strip()
+        if not new:
+            self._emit("error", message="Paraphrase returned nothing, showing the original text instead.",
+                       fatal=False, player=player.name)
+            self._annotate_call(call_id, paraphrase_failed=True)
+            return None, call_id
+        return new, call_id
+
+    def _public_text(self, player: Player, raw: str, call_id: str, word_limit: int,
+                     round_no: int | None = None) -> tuple[str, str, list[str], str | None]:
+        """Turn a reply into what other players see.
+
+        Pipeline: tidy ("Red:" prefixes, quotes) -> paraphrase (optional) -> normalize typography
+        -> word limit -> name rule (checked on the text before AND after paraphrasing).
+        Returns (shown_text, original_text, transforms, paraphrase_call_id).
+        """
         original = (raw or "").strip()
-        text = limit_words(clean_reply(original, self.rules.player_names), word_limit) or "(no reply)"
+        transforms: list[str] = []
+        text = clean_reply(original, self.rules.player_names)
+        before_paraphrase = text
+        para_id = None
+        if self.cfg.paraphrase.enabled and text:
+            new, para_id = self._paraphrase(player, text, round_no)
+            if new is not None:
+                text = clean_reply(new, self.rules.player_names)
+                transforms.append("paraphrased")
+        if self.rules.normalize_typography:
+            tidy = normalize_typography(text)
+            if tidy != text:
+                transforms.append("normalized")
+            text = tidy
+        text = limit_words(text, word_limit) or "(no reply)"
         if self.rules.name_rule == "no_names":
             matches = find_name_violations(text, self.name_terms)
+            if "paraphrased" in transforms:
+                matches += [m for m in find_name_violations(before_paraphrase, self.name_terms) if m not in matches]
             if matches:
                 redact = self.rules.redact_violations
                 self._emit("rule_violation", player=player.name, call_id=call_id, matches=matches, redacted=redact)
                 if redact:
-                    text = redact_names(text, self.name_terms)
-        return text, original
+                    redacted = redact_names(text, self.name_terms)
+                    if redacted != text:
+                        transforms.append("redacted")
+                    text = redacted
+        return text, original, transforms, para_id
 
     def _parallel(self, fn, players: list[Player]) -> dict[str, object]:
         """Run fn(player) for several players at once; results keyed by name."""
@@ -524,30 +678,31 @@ class Game:
     def _do_intros(self) -> None:
         self._emit("phase", phase="intro", round=None, label="Introductions")
         limit = self.rules.intro_word_limit
-        trio = [p for p in self.players if p.role == "trio"]
+        trio = [p for p in self.players if p.role == "trio"]   # all four in a no-imposter game
         for p in trio:
             self._emit("thinking", player=p.name, action="intro", round=None)
 
         def write_intro(p: Player):
-            res, call_id = self._call_text(p, "intro", prompts.intro_task(limit), None)
-            text, original = self._public_text(p, res.content, call_id, limit)
-            return text, original, res, call_id
+            res, call_id = self._call_text(p, "intro", self.prompts.intro_task(limit, self.allow_nobody), None)
+            return self._public_text(p, res.content, call_id, limit), res, call_id
 
         done = self._parallel(write_intro, trio)
-        # The imposter writes last, after reading the (cleaned/redacted) trio intros in seat order.
-        seen = [(p.name, done[p.name][0]) for p in trio]
         imp = self.imposter
-        self._emit("thinking", player=imp.name, action="intro", round=None)
-        res, call_id = self._call_text(imp, "intro", prompts.imposter_intro_task(seen, limit), None)
-        text, original = self._public_text(imp, res.content, call_id, limit)
-        done[imp.name] = (text, original, res, call_id)
+        if imp is not None:
+            # The imposter writes last, after reading the trio intros (as players will see them) in seat order.
+            seen = [(p.name, done[p.name][0][0]) for p in trio]
+            self._emit("thinking", player=imp.name, action="intro", round=None)
+            res, call_id = self._call_text(imp, "intro", self.prompts.imposter_intro_task(seen, limit), None,
+                                           trio_intros=seen)
+            done[imp.name] = (self._public_text(imp, res.content, call_id, limit), res, call_id)
 
         # Reveal all four in SEAT order.
         for p in self.players:
-            text, original, res, call_id = done[p.name]
+            (text, original, transforms, para_id), res, call_id = done[p.name]
             self._emit("message", player=p.name, kind="intro", round=None, turn=None, question_id=None,
-                       asker=None, text=text, original_text=original, reasoning=res.reasoning, call_id=call_id)
-        self._intros = [(p.name, done[p.name][0]) for p in self.players]
+                       asker=None, text=text, original_text=original, reasoning=res.reasoning, call_id=call_id,
+                       transforms=transforms, paraphrase_call_id=para_id)
+        self._intros = [(p.name, done[p.name][0][0]) for p in self.players]
         self._set_state("turn")
 
     def _do_turn(self) -> bool:
@@ -559,10 +714,13 @@ class Game:
 
         # 1. The question
         self._emit("thinking", player=asker.name, action="question", round=r)
-        res, call_id = self._call_text(asker, "question", prompts.question_task(r, t, self.rules.question_word_limit), r)
-        question, original = self._public_text(asker, res.content, call_id, self.rules.question_word_limit)
+        res, call_id = self._call_text(asker, "question",
+                                       self.prompts.question_task(r, t, self.rules.question_word_limit), r, turn=t)
+        question, original, transforms, para_id = self._public_text(asker, res.content, call_id,
+                                                                    self.rules.question_word_limit, r)
         self._emit("message", player=asker.name, kind="question", round=r, turn=t, question_id=qid,
-                   asker=asker.name, text=question, original_text=original, reasoning=res.reasoning, call_id=call_id)
+                   asker=asker.name, text=question, original_text=original, reasoning=res.reasoning, call_id=call_id,
+                   transforms=transforms, paraphrase_call_id=para_id)
 
         # 2. Everyone answers
         order = self._answer_order(asker.name)
@@ -574,22 +732,22 @@ class Game:
 
         def answer(p: Player, earlier: list[tuple[str, str]] | None):
             sequential = self.rules.answer_mode == "sequential"
-            task = prompts.answer_task(asker.name, question, p.name, limit, earlier, sequential, calls_on)
-            res, call_id = self._call_text(p, "answer", task, r)
+            task = self.prompts.answer_task(asker.name, question, p.name, limit, earlier, sequential, calls_on)
+            res, call_id = self._call_text(p, "answer", task, r, turn=t, question=question, asker=asker.name)
             wants_vote, content = None, res.content
             if calls_on:
                 wants_vote, content = parse_vote_call(res.content)
                 self._annotate_call(call_id, wants_vote=wants_vote, vote_call_note=None if wants_vote is not None
                                     else "no readable 'CALL VOTE: YES/NO' line; counted as NO")
-            text, _ = self._public_text(p, content, call_id, limit)
-            return text, (res.content or "").strip(), res, call_id, wants_vote
+            text, _, transforms, para_id = self._public_text(p, content, call_id, limit, r)
+            return text, (res.content or "").strip(), res, call_id, wants_vote, transforms, para_id
 
         def show(p: Player, result) -> None:
-            text, original, res, call_id, wants_vote = result
+            text, original, res, call_id, wants_vote, transforms, para_id = result
             extra = {"wants_vote": wants_vote} if calls_on else {}
             self._emit("message", player=p.name, kind="answer", round=r, turn=t, question_id=qid,
                        asker=asker.name, text=text, original_text=original, reasoning=res.reasoning,
-                       call_id=call_id, **extra)
+                       call_id=call_id, transforms=transforms, paraphrase_call_id=para_id, **extra)
             answers.append((p.name, text))
             wants[p.name] = wants_vote
             if calls_on:
@@ -636,16 +794,22 @@ class Game:
     def _cast_vote(self, p: Player, number: int, note: str = "") -> dict:
         valid_names = [x.name for x in self.players if x is not p]
         threshold = self.rules.vote_threshold
-        messages = self._messages(p, prompts.vote_task(number, p.name, valid_names, threshold, note))
-        res, call_id = self._call(p, "vote", messages, self.rounds_completed)
-        target, problem = parse_vote(res.content, p.name, self.rules.player_names)
+        nobody = self.allow_nobody
+        messages = self._messages(p, self.prompts.vote_task(number, p.name, valid_names, threshold, note, nobody))
+        ctx = self._context(p, valid_choices=valid_names, vote_number=number)
+        res, call_id = self._call(p, "vote", messages, self.rounds_completed, context=ctx)
+        target, problem = parse_vote(res.content, p.name, self.rules.player_names, nobody)
         first_problem = problem
         if target is None:
             retry = messages + [{"role": "assistant", "content": res.content or "(no reply)"},
-                                {"role": "user", "content": prompts.vote_retry_message(problem, valid_names)}]
-            res, call_id = self._call(p, "vote_retry", retry, self.rounds_completed)
-            target, problem = parse_vote(res.content, p.name, self.rules.player_names)
-        return {"target": target, "valid": target is not None, "raw_text": res.content,
+                                {"role": "user", "content": self.prompts.vote_retry_message(problem, valid_names,
+                                                                                           nobody)}]
+            res, call_id = self._call(p, "vote_retry", retry, self.rounds_completed, context={**ctx, "is_retry": True})
+            target, problem = parse_vote(res.content, p.name, self.rules.player_names, nobody)
+        voted_nobody = target == NOBODY
+        abstain_reason = "nobody" if voted_nobody else ("invalid" if target is None else None)
+        return {"target": None if voted_nobody else target, "valid": target is not None,
+                "abstain_reason": abstain_reason, "raw_text": res.content,
                 "reasoning": strip_vote_line(res.content) or None, "model_reasoning": res.reasoning,
                 "call_id": call_id, "retried": first_problem is not None,
                 "problem": problem if target is None else first_problem}
@@ -659,42 +823,47 @@ class Game:
         note = ""
         if self.rules.player_vote_calls:
             continues = decide_after_vote(None, self.rounds_completed, self.rules, trigger) == "continue"
-            note = prompts.vote_trigger_note(trigger, call_count, continues)
+            note = self.prompts.vote_trigger_note(trigger, call_count, continues, self.allow_nobody)
         for p in self.players:
             self._emit("thinking", player=p.name, action="vote", round=self.rounds_completed)
         results = self._parallel(lambda p: self._cast_vote(p, n, note), self.players)
 
-        ballots: dict[str, str | None] = {}
+        ballots: dict[str, str | None] = {}         # NOBODY and invalid votes are None (abstain)
+        shown_ballots: dict[str, str | None] = {}   # for the public transcript: NOBODY spelled out
         for p in self.players:
             v = results[p.name]
             ballots[p.name] = v["target"]
-            self._own_votes[p.name].append((n, v["target"]))
+            shown_ballots[p.name] = NOBODY if v["abstain_reason"] == "nobody" else v["target"]
+            self._own_votes[p.name].append((n, shown_ballots[p.name]))
             self._emit("vote_cast", player=p.name, target=v["target"], reasoning=v["reasoning"],
                        raw_text=v["raw_text"], valid=v["valid"], call_id=v["call_id"], vote_number=n,
-                       retried=v["retried"], problem=v["problem"], model_reasoning=v["model_reasoning"])
+                       retried=v["retried"], problem=v["problem"], model_reasoning=v["model_reasoning"],
+                       abstain_reason=v["abstain_reason"])
 
         outcome = resolve_vote(ballots, self.cfg)
         elim_role = self.by_name[outcome.eliminated].role if outcome.eliminated else None
-        decision = decide_after_vote(elim_role, self.rounds_completed, self.rules, trigger)
+        decision = decide_after_vote(elim_role, self.rounds_completed, self.rules, trigger, self.has_imposter)
+        nobody_votes = sum(1 for v in results.values() if v["abstain_reason"] == "nobody")
         self._emit("vote_result", vote_number=n, tally=outcome.tally, ballots=ballots,
                    eliminated=outcome.eliminated, eliminated_role=elim_role, decision=decision,
                    rounds_completed=self.rounds_completed, trigger=trigger, call_count=call_count,
-                   turns_completed=self.turns_completed)
+                   turns_completed=self.turns_completed, has_imposter=self.has_imposter, nobody_votes=nobody_votes)
 
         trio_names = {p.name for p in self.players if p.role == "trio"}
+        imp_name = self.imposter.name if self.imposter else None
         self.votes.append({
             "vote_number": n, "rounds_completed": self.rounds_completed, "tally": outcome.tally,
             "ballots": ballots, "eliminated": outcome.eliminated, "eliminated_role": elim_role,
             "decision": decision, "trigger": trigger, "call_count": call_count,
-            "turns_completed": self.turns_completed,
+            "turns_completed": self.turns_completed, "nobody_votes": nobody_votes,
             "imposter_votes_from_trio": sum(1 for v, t in ballots.items()
-                                            if v in trio_names and t == self.imposter.name),
+                                            if v in trio_names and imp_name and t == imp_name),
             "trio_valid_ballots": sum(1 for v, t in ballots.items() if v in trio_names and t is not None),
         })
         self._entries.append({
             "kind": "vote", "vote_number": n, "tally": outcome.tally,
             "called_count": call_count if "called" in trigger else None, "num_players": len(self.players),
-            "ballots": ballots if self.rules.reveal_votes else None,
+            "ballots": shown_ballots if self.rules.reveal_votes else None,
             "result_text": prompts.vote_result_text(outcome.eliminated, outcome.tally,
                                                     self.rules.vote_threshold, decision == "continue"),
         })
@@ -705,7 +874,7 @@ class Game:
             return
         if outcome.eliminated:
             self.eliminated_by = trigger
-        winner = {"trio_win": "trio", "imposter_win": "imposter"}.get(decision)
+        winner = WINNER_OF.get(decision)
         self._finish(decision, winner=winner, eliminated=outcome.eliminated, eliminated_role=elim_role,
                      rounds_survived=self.rounds_completed if outcome.eliminated else None)
 
@@ -740,7 +909,7 @@ class Game:
                        num_api_calls=len(self.calls),
                        log_file=str(self.logger.json_path) if self._started else None,
                        transcript_file=str(self.logger.md_path) if self._started else None, reason=reason,
-                       imposter=self.imposter.name)
+                       imposter=self.imposter.name if self.imposter else None, has_imposter=self.has_imposter)
         if not self._started:
             return          # never played: leave no files behind
         self._write_logs()
@@ -766,6 +935,10 @@ class Game:
                 "players": [p.public_dict() for p in self.players],
                 "seat_order": [p.name for p in self.players],
                 "system_prompts": {p.name: p.system_prompt for p in self.players},
+                "has_imposter": self.has_imposter,
+                "prompt_version": self.prompts.version, "prompts_modified": self.prompts.modified,
+                "prompt_warnings": list(self.prompts.warnings),
+                "templates": dict(self.prompts.templates),
                 "state": {"state": self._state, "round": self.round, "turn": self.turn,
                           "rounds_completed": self.rounds_completed, "vote_number": self.vote_number,
                           "turns_completed": self.turns_completed, "pending_vote_trigger": self._vote_trigger},
@@ -793,7 +966,10 @@ class Game:
         cfg = self.cfg
         winner_model = {"trio": cfg.trio.model, "imposter": cfg.imposter.model}.get(self.winner or "")
         elim_model = self.by_name[self.eliminated].model if self.eliminated else None
-        imposter_rounds = (self.rounds_survived if self.eliminated_role == "imposter" else self.rounds_completed)
+        if not self.has_imposter:
+            imposter_rounds = None
+        else:
+            imposter_rounds = (self.rounds_survived if self.eliminated_role == "imposter" else self.rounds_completed)
         return {
             "game_id": self.game_id, "timestamp": self.finished_at, "mock": self.mock, "seed": self.seed,
             "trio_model": cfg.trio.model, "imposter_model": cfg.imposter.model,
@@ -802,7 +978,14 @@ class Game:
             "name_rule": self.rules.name_rule, "answer_mode": self.rules.answer_mode,
             "rounds_before_vote": self.rules.rounds_before_vote, "vote_threshold": self.rules.vote_threshold,
             "on_no_decision": self.rules.on_no_decision,
-            "imposter_seat": self.imposter.name,
+            "imposter_seat": self.imposter.name if self.imposter else None,
+            "has_imposter": self.has_imposter,
+            "no_imposter_chance": self.rules.no_imposter_chance,
+            "prompt_version": self.prompts.version, "prompts_modified": self.prompts.modified,
+            "normalize_typography": self.rules.normalize_typography,
+            "paraphrase_model": self.cfg.paraphrase.model if self.cfg.paraphrase.enabled else None,
+            "imposter_knows_own_model": self.rules.imposter_knows_own_model,
+            "intro_word_limit": self.rules.intro_word_limit,
             "outcome": self.outcome, "winner": self.winner, "winner_model": winner_model,
             "eliminated": self.eliminated, "eliminated_role": self.eliminated_role,
             "eliminated_model": elim_model, "rounds_survived": self.rounds_survived,
@@ -818,7 +1001,7 @@ class Game:
             "votes": [{"vote_number": v["vote_number"], "rounds_completed": v["rounds_completed"],
                        "turns_completed": v["turns_completed"], "trigger": v["trigger"],
                        "call_count": v["call_count"], "tally": v["tally"], "ballots": v["ballots"],
-                       "eliminated": v["eliminated"]}
+                       "nobody_votes": v["nobody_votes"], "eliminated": v["eliminated"]}
                       for v in self.votes],
             "imposter_votes_received_by_trio": [v["imposter_votes_from_trio"] for v in self.votes],
             "trio_valid_ballots": [v["trio_valid_ballots"] for v in self.votes],

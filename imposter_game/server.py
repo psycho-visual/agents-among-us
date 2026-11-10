@@ -16,6 +16,12 @@ POST /api/new_game     -> reload config.toml from disk and create a new (not sta
 POST /api/next_round   -> play until the end of the current round / vote (in a background thread)
 POST /api/run_all      -> play until the game is over (in a background thread)
 POST /api/pause        -> pause after the current turn finishes
+GET  /api/prompts          -> editable prompt templates + current prompt version
+GET  /api/prompts/preview  -> prompts rendered with the current config.toml and sample data
+POST /api/prompts/validate {id, text} -> {errors, warnings}
+POST /api/prompts/save     {id, text} -> {ok, errors, warnings}   (writes prompts/<id>.txt)
+POST /api/prompts/reset    {id}       -> back to the default text  (deletes prompts/<id>.txt)
+Prompt edits apply to the next New game, never to a game in progress.
 """
 
 from __future__ import annotations
@@ -117,14 +123,28 @@ def _load_engine() -> SimpleNamespace:
     from imposter_game import openrouter as or_mod
     from imposter_game import stats as stats_mod
 
+    try:
+        from imposter_game import prompts as prompts_mod
+    except Exception:  # an older engine without editable prompts
+        prompts_mod = None
+
     return SimpleNamespace(
         config=config_mod,
+        prompts=prompts_mod,
         load_config=config_mod.load_config,
         Game=game_mod.Game,
         OpenRouterClient=or_mod.OpenRouterClient,
         MockClient=or_mod.MockClient,
         compute_stats=stats_mod.compute_stats,
     )
+
+
+class PromptError(Exception):
+    """A prompt-editor request that can't be served; carries the HTTP status to use."""
+
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
 
 
 class GameController:
@@ -139,6 +159,7 @@ class GameController:
         seed: int | None = None,
         engine: Any = None,
         keepalive_seconds: float = 15.0,
+        prompts_dir: str | os.PathLike | None = None,
     ):
         self.config_path = Path(config_path).resolve()
         self.mock = bool(mock)
@@ -146,6 +167,8 @@ class GameController:
         self.mock_options = dict(mock_options or {})
         self.seed = seed
         self.keepalive_seconds = keepalive_seconds
+        # Where user prompt overrides live (None = the engine's default, prompts/ in the repo root).
+        self.prompts_dir = Path(prompts_dir).resolve() if prompts_dir else None
         self._engine = engine
         self.engine_error: str | None = None
 
@@ -378,6 +401,7 @@ class GameController:
                         self.engine.Game, self.cfg, client,
                         lambda ev, g=generation: self._on_engine_event(ev, g),
                         log_dir=self.log_dir, mock=self.mock, seed=self.seed,
+                        **({"prompts_dir": self.prompts_dir} if self.prompts_dir else {}),
                     )
                 except Exception as exc:
                     traceback.print_exc()
@@ -488,6 +512,95 @@ class GameController:
         with self._clients_lock:
             for q in self._clients:
                 q.put(None)
+
+    # ------------------------------------------------------------------ prompt templates
+    PROMPTS_NOTE = "Changes apply when you click New game. Each game records its prompt version."
+
+    def _prompts_mod(self):
+        mod = getattr(self.engine, "prompts", None)
+        if mod is None or not callable(getattr(mod, "list_templates", None)):
+            raise PromptError("This version of the game engine has no editable prompts.", 501)
+        return mod
+
+    def _pcall(self, name: str, *args):
+        """Call a prompts-module function, pointing it at self.prompts_dir when one is configured."""
+        fn = getattr(self._prompts_mod(), name)
+        if self.prompts_dir is None:
+            return fn(*args)
+        return _call_with_supported_kwargs(fn, *args, prompts_dir=self.prompts_dir)
+
+    def _check_template_id(self, template_id: Any) -> str:
+        if not isinstance(template_id, str) or not template_id:
+            raise PromptError("Missing template id.", 400)
+        ids = {t.get("id") for t in self._pcall("list_templates")}
+        if template_id not in ids:
+            raise PromptError(f"Unknown prompt template: {template_id!r}", 404)
+        return template_id
+
+    def _current_game_prompt_info(self) -> dict:
+        with self._clients_lock:
+            for ev in self._history:
+                if ev.get("type") == "game_started":
+                    cfg = ev.get("config") if isinstance(ev.get("config"), dict) else {}
+                    return {"prompt_version": ev.get("prompt_version", cfg.get("prompt_version")),
+                            "prompts_modified": ev.get("prompts_modified", cfg.get("prompts_modified"))}
+        return {"prompt_version": None, "prompts_modified": None}
+
+    def prompts_list(self) -> dict:
+        templates = self._pcall("list_templates")
+        version = None
+        fn = getattr(self._prompts_mod(), "prompt_version", None)
+        if callable(fn):
+            for arg in ({t["id"]: t.get("text", "") for t in templates}, templates):
+                try:
+                    version = fn(arg)
+                    break
+                except Exception:
+                    continue
+        return {
+            "ok": True,
+            "templates": templates,
+            "prompt_version": version,
+            "modified": any(bool(t.get("modified")) for t in templates),
+            "current_game": self._current_game_prompt_info(),
+            "note": self.PROMPTS_NOTE,
+        }
+
+    def prompts_validate(self, template_id: Any, text: Any) -> dict:
+        template_id = self._check_template_id(template_id)
+        if not isinstance(text, str):
+            raise PromptError("Template text must be a string.", 400)
+        res = self._pcall("validate_template", template_id, text) or {}
+        return {"ok": True, "errors": list(res.get("errors") or []), "warnings": list(res.get("warnings") or [])}
+
+    def prompts_save(self, template_id: Any, text: Any) -> dict:
+        template_id = self._check_template_id(template_id)
+        if not isinstance(text, str):
+            raise PromptError("Template text must be a string.", 400)
+        res = self._pcall("save_template", template_id, text) or {}
+        out = {"ok": bool(res.get("ok", not res.get("errors"))), "errors": list(res.get("errors") or []),
+               "warnings": list(res.get("warnings") or [])}
+        out["message"] = ("Saved. It will be used from the next New game." if out["ok"]
+                          else "Not saved: fix the errors first.")
+        return out
+
+    def prompts_reset(self, template_id: Any) -> dict:
+        template_id = self._check_template_id(template_id)
+        res = self._pcall("reset_template", template_id)
+        out = dict(res) if isinstance(res, dict) else {}
+        out.setdefault("ok", True)
+        out["message"] = "Reset to the default text. It will be used from the next New game."
+        return out
+
+    def prompts_preview(self) -> dict:
+        mod = self._prompts_mod()
+        if not callable(getattr(mod, "preview", None)):
+            raise PromptError("This version of the game engine cannot preview prompts.", 501)
+        try:
+            cfg = _call_with_supported_kwargs(self.engine.load_config, self.config_path, read_key=False)
+        except Exception as exc:
+            raise PromptError(f"Can't preview: {exc}", 409)
+        return {"ok": True, "preview": _jsonable(self._pcall("preview", cfg)), "note": self.PROMPTS_NOTE}
 
     # ------------------------------------------------------------------ stats
     def stats(self) -> dict:
@@ -600,6 +713,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json(self.controller.stats())
             if path == "/api/log":
                 return self._send_json(self.controller.log_info())
+            if path == "/api/prompts":
+                return self._prompt_action(self.controller.prompts_list)
+            if path == "/api/prompts/preview":
+                return self._prompt_action(self.controller.prompts_preview)
             return self._send_error_json(404, "Not found")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
@@ -607,11 +724,31 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._host_ok():
             return self._send_error_json(403, "Forbidden origin")
-        length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(min(length, 1_000_000))
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 2_000_000:
+            return self._send_error_json(413, "Request too large")
+        raw = self.rfile.read(length) if length > 0 else b""
         path = urlsplit(self.path).path
         c = self.controller
+        if path.startswith("/api/prompts/"):
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return self._send_error_json(400, "Request body must be JSON")
+            if not isinstance(body, dict):
+                return self._send_error_json(400, "Request body must be a JSON object")
+            prompt_actions = {
+                "/api/prompts/validate": lambda: c.prompts_validate(body.get("id"), body.get("text")),
+                "/api/prompts/save": lambda: c.prompts_save(body.get("id"), body.get("text")),
+                "/api/prompts/reset": lambda: c.prompts_reset(body.get("id")),
+            }
+            action = prompt_actions.get(path)
+            if action is None:
+                return self._send_error_json(404, "Not found")
+            return self._prompt_action(action)
         actions = {
             "/api/new_game": c.new_game,
             "/api/next_round": lambda: c.start("round"),
@@ -629,6 +766,20 @@ class _Handler(BaseHTTPRequestHandler):
         status_code = 200 if ok else 409
         try:
             self._send_json({"ok": ok, "message": message, "status": c.status()}, status_code)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def _prompt_action(self, action: Callable[[], dict]) -> None:
+        try:
+            result = action()
+            status = 200
+        except PromptError as exc:
+            result, status = {"ok": False, "message": str(exc)}, exc.status
+        except Exception as exc:
+            traceback.print_exc()
+            result, status = {"ok": False, "message": f"Prompt templates error: {exc}"}, 500
+        try:
+            self._send_json(result, status)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 

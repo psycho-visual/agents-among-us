@@ -1,0 +1,1 @@
+NAME RULE: Players may claim to be any AI model, or decline to say. Claims may be true or false — lying about which model you are is allowed, for everyone.
