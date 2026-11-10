@@ -127,7 +127,12 @@ behaviour until your first game confirms it:
 
 ## Changing the setup
 
-Everything is in **`config.toml`**, a plain-text file with comments. Open it in any text editor.
+The easiest way is the **Settings ⚙** button in the app. Every option has a plain-English explanation,
+the model picker searches OpenRouter's model list with prices, and **Swap trio ↔ imposter** swaps the roles.
+Saving writes to `config.toml` and keeps all its comments. The previous version is saved as
+`config.toml.bak`, and changes apply when you click **New game**.
+
+Everything is stored in **`config.toml`**, a plain-text file with comments, so you can also edit it in any text editor.
 
 - **Models:** change `model` under `[trio]` and `[imposter]`. Use OpenRouter model IDs, which you can
   find at <https://openrouter.ai/models>. `display_name` is the name the trio is told they are.

@@ -17,6 +17,7 @@
       <span id="mock-badge" class="badge badge-mock" hidden title="Fake models: no API calls, no cost">MOCK</span>
     </div>
     <nav class="controls" aria-label="Game controls">
+      <button id="btn-settings" type="button" class="ghost" title="Models, rules and other options (config.toml)">Settings ⚙</button>
       <button id="btn-prompts" type="button" class="ghost" title="View and edit the prompts the players are given">Prompts ✎</button>
       <span class="controls-sep" aria-hidden="true"></span>
       <button id="btn-new" type="button" title="Reload config.toml and set up a fresh game">New game</button>
@@ -109,7 +110,35 @@
     </section>
   </div>
 
+  <div id="settings-drawer" class="drawer" hidden>
+    <div class="drawer-backdrop" id="sd-backdrop"></div>
+    <section class="drawer-panel sd-panel" role="dialog" aria-modal="true" aria-labelledby="sd-title">
+      <header class="drawer-head">
+        <h2 id="sd-title">Settings</h2>
+        <label class="toggle" title="Show rarely-needed options such as API timeouts and retries">
+          <input type="checkbox" id="sd-advanced"> <span>Show advanced</span>
+        </label>
+        <span class="spacer"></span>
+        <span id="sd-dirty" class="chip chip-unsaved" hidden>● unsaved changes</span>
+        <button type="button" id="sd-close" class="icon-btn" title="Close (Esc)" aria-label="Close">×</button>
+      </header>
+      <div class="drawer-note small">
+        ℹ️ Saved to <code id="sd-path">config.toml</code> — the comments in that file are kept, and the previous
+        version is backed up. Changes apply when you click <b>New game</b>. Your API key is not shown here; it stays in <code>.env</code>.
+      </div>
+      <div id="sd-body" class="sd-body"><p class="muted">Loading…</p></div>
+      <footer class="sd-foot">
+        <div id="sd-msg" class="sd-msg small"></div>
+        <span class="spacer"></span>
+        <button type="button" id="sd-revert" title="Throw away the changes you haven't saved">Revert</button>
+        <button type="button" id="sd-save" title="Save to config.toml">Save</button>
+        <button type="button" id="sd-save-new" class="primary">Save &amp; start new game</button>
+      </footer>
+    </section>
+  </div>
+
   <script src="/static/app.js"></script>
+  <script src="/static/settings.js"></script>
   <script src="/static/prompts.js"></script>
 </body>
 </html>

@@ -319,6 +319,10 @@
 
   // ------------------------------------------------------------------ open / close
   function open() {
+    // Only one drawer at a time: close the others first (they may ask about unsaved changes).
+    for (const [name, d] of Object.entries(window.AAUDrawers || {})) {
+      if (name !== "prompts" && d.isOpen() && !d.close()) return;
+    }
     drawer.hidden = false;
     document.body.classList.add("drawer-open");
     setTab("edit");
@@ -328,12 +332,15 @@
     const dirty = dirtyIds();
     if (dirty.length) {
       const names = dirty.map((id) => `• ${(P.byId[id] && P.byId[id].title) || id}`).join("\n");
-      if (!confirm(`You have unsaved changes in:\n${names}\n\nClose and discard them?`)) return;
+      if (!confirm(`You have unsaved changes in:\n${names}\n\nClose and discard them?`)) return false;
       P.drafts = {};
     }
     drawer.hidden = true;
     document.body.classList.remove("drawer-open");
+    return true;
   }
+  window.AAUDrawers = window.AAUDrawers || {};
+  window.AAUDrawers.prompts = { isOpen: () => !drawer.hidden, close };
 
   $("btn-prompts").addEventListener("click", open);
   $("pd-close").addEventListener("click", close);
