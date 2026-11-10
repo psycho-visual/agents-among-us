@@ -35,6 +35,9 @@ NAME_LINE = "Your name in this game is {name}."
 IMPOSTER_LINE = "You are the IMPOSTER."
 VALID_CHOICES_LINE = "Valid choices: {names}"
 
+CALL_VOTE_YES = "CALL VOTE: YES"
+CALL_VOTE_NO = "CALL VOTE: NO"
+
 TRANSCRIPT_START = "=== PUBLIC TRANSCRIPT (everything all players have seen so far) ==="
 TRANSCRIPT_END = "=== END OF TRANSCRIPT ==="
 
@@ -80,6 +83,16 @@ def rules_text(rules, seat_names: list[str]) -> str:
                      "true or false — lying about which model you are is allowed, for everyone.")
     reveal = ("After each vote, everyone is shown who voted for whom."
               if rules.reveal_votes else "Individual votes are never revealed; only the result is announced.")
+    calls_on = getattr(rules, "player_vote_calls", False)
+    if calls_on and rules.on_no_decision == "end":
+        no_decision = (f"If nobody gets {rules.vote_threshold} or more votes in a scheduled vote, the game ends "
+                       "immediately with NO winner.")
+    if calls_on:
+        votes_intro = (f"after every {rounds_word} a vote is held automatically (a \"scheduled\" vote). "
+                       "Players can also call a vote (see VOTE CALLS below). Every vote is a secret ballot")
+    else:
+        votes_intro = (f"after every {rounds_word} a vote is held automatically (players cannot call votes). "
+                       "It is a secret ballot")
 
     return f"""You are playing "Agents Among Us", a social-deduction game for four players.
 All four players are AI language models. There are no humans in the game.
@@ -92,14 +105,36 @@ THE PLAYERS
 HOW THE GAME GOES
 1. Introductions: every player writes a short introduction. The three trio members write theirs at the same time, without seeing anyone else's. The imposter writes its introduction after reading the three trio introductions. All four are then revealed together, in seat order.
 2. Rounds: in each round every player, in seat order, asks one question. After each question ALL four players answer it, including the player who asked. {answering}
-3. Votes: after every {rounds_word} a vote is held automatically (players cannot call votes). It is a secret ballot: everyone votes at the same time for one other player; you cannot vote for yourself. A player who receives {rules.vote_threshold} or more votes is voted out. {reveal}
+3. Votes: {votes_intro}: everyone votes at the same time for one other player; you cannot vote for yourself. A player who receives {rules.vote_threshold} or more votes is voted out. {reveal}
 
 HOW THE GAME ENDS
 - If the imposter is voted out, the trio wins.
 - If a trio member is voted out, the imposter wins immediately.
 - {no_decision}
-
+{vote_calls_text(rules) if calls_on else ""}
 {name_rule}"""
+
+
+def vote_calls_text(rules) -> str:
+    """Rules paragraph for player-called votes (only used when the feature is on)."""
+    k = rules.vote_call_threshold
+    if rules.reveal_vote_calls:
+        visibility = "After each question, everyone is shown which players asked for a vote."
+    else:
+        visibility = ("Requests are secret: players only learn that a vote was called and how many players "
+                      "asked for it, never who.")
+    failed = ("If nobody is voted out in a called vote, nobody is removed and the game simply continues; "
+              "a failed called vote never ends the game.")
+    if rules.on_no_decision == "end":
+        failed += " (Only a failed scheduled vote ends the game with no winner.)"
+    return f"""
+VOTE CALLS
+- After answering each question, every player privately says whether it wants a vote to be held right now.
+- If {k} or more players ask for a vote after the same question, a vote is held immediately, before the next question. Calling a vote does not change when the scheduled votes happen.
+- {visibility}
+- A called vote works exactly like a scheduled vote (same secret ballot, {rules.vote_threshold} votes needed). {failed}
+- If a vote is called right when a scheduled vote is due, only one vote is held, and it counts as the scheduled vote.
+"""
 
 
 def role_text(name: str, role: str, model_display_name: str, other_names: list[str]) -> str:
@@ -143,9 +178,11 @@ def render_transcript(intros: list[tuple[str, str]], entries: list[dict]) -> str
 
     intros:  [(name, text)] in seat order (empty before introductions are revealed).
     entries: chronological list of dicts, each either
-             {"kind": "turn", "round", "turn", "asker", "question", "answers": [(name, text)]}
+             {"kind": "turn", "round", "turn", "asker", "question", "answers": [(name, text)],
+              "requesters": [names] | None (None = vote requests not shown)}
              {"kind": "vote", "vote_number", "ballots": {voter: target|None} | None,
-              "tally": {name: n}, "result_text": str}
+              "tally": {name: n}, "result_text": str,
+              "called_count": int | None (set when players called this vote), "num_players": int}
     """
     lines = [TRANSCRIPT_START]
     if not intros and not entries:
@@ -166,8 +203,13 @@ def render_transcript(intros: list[tuple[str, str]], entries: list[dict]) -> str
             lines.append(f"Question {e['turn']} of round {e['round']}, asked by {e['asker']}: {e['question']}")
             for name, text in e["answers"]:
                 lines.append(f"  {name} answered: {text}")
+            if e.get("requesters") is not None:
+                lines.append(f"  Vote requests: {', '.join(e['requesters']) if e['requesters'] else 'none'}")
         elif e["kind"] == "vote":
             lines.append("")
+            if e.get("called_count") is not None:
+                lines.append(f"The players called a vote ({e['called_count']} of {e.get('num_players', 4)} "
+                             "requested one).")
             lines.append(f"--- Vote {e['vote_number']} ---")
             if e.get("ballots") is not None:
                 for voter, target in e["ballots"].items():
@@ -224,7 +266,8 @@ At most {word_limit} words. Reply with the question only."""
 
 
 def answer_task(asker: str, question: str, me: str, word_limit: int,
-                earlier_answers: list[tuple[str, str]] | None, sequential: bool) -> str:
+                earlier_answers: list[tuple[str, str]] | None, sequential: bool,
+                vote_calls: bool = False) -> str:
     who = "You asked this question; now give your own answer." if asker == me else f"{asker} asked this question."
     if not sequential:
         timing = "All players answer at the same time; you will not see the other answers before writing yours."
@@ -235,16 +278,37 @@ def answer_task(asker: str, question: str, me: str, word_limit: int,
     else:
         timing = "Players answer one at a time; you are answering first."
         before = ""
+    if vote_calls:
+        ending = f"""At most {word_limit} words. Reply with your answer, then end with exactly one final line, either
+{CALL_VOTE_YES}
+or
+{CALL_VOTE_NO}
+YES means you want a vote to be held right after this question. That line is removed from your answer before the other players see it and does not count towards the word limit."""
+    else:
+        ending = f"At most {word_limit} words. Reply with your answer only."
     return f"""{TASK_ANSWER}
 {who}
 Question from {asker}: {question}
 {timing}{before}
-At most {word_limit} words. Reply with your answer only."""
+{ending}"""
 
 
-def vote_task(vote_number: int, me: str, valid: list[str], threshold: int) -> str:
+def vote_trigger_note(trigger: str, count: int | None, no_decision_continues: bool) -> str:
+    """One line telling voters why this vote is happening (only used when vote calls are enabled)."""
+    if trigger == "called":
+        why = f"This vote was called by the players ({count} asked for it)."
+    elif trigger == "called+scheduled":
+        why = f"This is a scheduled vote (the players also called for one: {count} asked)."
+    else:
+        why = "This is a scheduled vote."
+    then = (" If nobody is voted out, the game continues." if no_decision_continues
+            else " If nobody is voted out, the game ends with no winner.")
+    return why + then + "\n"
+
+
+def vote_task(vote_number: int, me: str, valid: list[str], threshold: int, note: str = "") -> str:
     return f"""{TASK_VOTE}
-Vote {vote_number}. This is a secret ballot; your reasoning here is private and will not be shown to the other players.
+{note}Vote {vote_number}. This is a secret ballot; your reasoning here is private and will not be shown to the other players.
 Choose the one player you want voted out. A player with {threshold} or more votes is voted out. You cannot vote for yourself ({me}).
 {VALID_CHOICES_LINE.format(names=", ".join(valid))}
 Think it through, then end your reply with exactly one line in this form:

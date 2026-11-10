@@ -86,6 +86,20 @@ on_no_decision = "end"
 # Only used with on_no_decision = "continue".
 max_rounds = 6
 
+# Let players CALL a vote (in addition to the automatic votes above).
+# After answering each question, every player secretly says whether it wants
+# a vote now ("CALL VOTE: YES" or "NO"). If enough players say YES in the same
+# turn, a vote is held straight away. If such a called vote removes nobody,
+# the game simply continues (whatever on_no_decision says).
+player_vote_calls = true
+
+# How many players must ask for a vote in the same turn to call one (1-4).
+vote_call_threshold = 3
+
+# true  — the public transcript shows who asked for a vote after each question.
+# false — requests stay secret; players only learn when a vote is called.
+reveal_vote_calls = false
+
 # How players answer each question:
 #   "simultaneous" — everyone answers blind, at the same time; answers are revealed together.
 #   "sequential"   — players answer one after another (seat order, starting after

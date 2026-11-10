@@ -85,6 +85,21 @@ def print_report(rows: list[dict], label: str, out=None) -> None:
           f"(n={rs['count']})", file=out)
     print(f"Rounds the imposter survived: mean {num(irs['mean'])}, median {num(irs['median'])} "
           f"(n={irs['count']})", file=out)
+    vc = s["vote_calls"]
+    if vc["games_with_vote_calls"] or vc["votes_by_trigger"].get("called"):
+        print(file=out)
+        print(f"Player-called votes (feature on in {vc['games_with_vote_calls']} game(s))", file=out)
+        trig = vc["votes_by_trigger"]
+        print("  Votes held: " + (", ".join(f"{k} {v}" for k, v in sorted(trig.items())) or "none")
+              + f"  (called total {vc['called_votes']}, scheduled total {vc['scheduled_votes']};"
+              " a merged called+scheduled vote counts in both)", file=out)
+        elim = vc["eliminations_by_trigger"]
+        print("  Eliminations by vote type: " + (", ".join(f"{k} {v}" for k, v in sorted(elim.items())) or "none"),
+              file=out)
+        if vc["vote_requests_by_model"]:
+            table(["model", "asked YES", "said NO", "no answer", "YES rate"],
+                  [[m, r["yes"], r["no"], r["missing"], pct(r["yes_rate"])]
+                   for m, r in sorted(vc["vote_requests_by_model"].items())], out)
     print(file=out)
     cost, tok = s["cost_usd"], s["tokens"]
     print(f"Cost per game: mean {money(cost['mean'])}, min {money(cost['min'])}, max {money(cost['max'])};"
@@ -95,8 +110,9 @@ def print_report(rows: list[dict], label: str, out=None) -> None:
 
 CSV_FIELDS = ["game_id", "timestamp", "mock", "trio_model", "imposter_model", "trio_effort", "imposter_effort",
               "name_rule", "answer_mode", "rounds_before_vote", "vote_threshold", "on_no_decision",
-              "imposter_seat", "outcome", "winner", "winner_model", "eliminated", "eliminated_role",
-              "eliminated_model", "rounds_survived", "imposter_rounds_survived", "rounds_completed",
+              "imposter_seat", "player_vote_calls", "vote_call_threshold", "outcome", "winner", "winner_model", "eliminated", "eliminated_role",
+              "eliminated_model", "eliminated_by", "rounds_survived", "imposter_rounds_survived", "rounds_completed",
+              "turns_completed", "called_votes", "scheduled_votes", "vote_requests_by_model",
               "imposter_votes_received_by_trio", "total_cost_usd", "total_input_tokens", "total_output_tokens",
               "num_api_calls", "cost_by_model", "reasoning_returned", "log_file"]
 

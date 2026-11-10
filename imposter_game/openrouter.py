@@ -661,7 +661,18 @@ class MockClient:
         text = rng.choice(_MOCK_QA.get(question, _MOCK_GENERIC_ANSWERS))
         if no_names and rng.random() < self.name_slip_rate / 2:
             text += " (My training at OpenAI taught me that.)"
-        return text + (rng.choice(_MOCK_ANSWER_ENDS) if text[-1:] in ".!?" else "")
+        text += rng.choice(_MOCK_ANSWER_ENDS) if text[-1:] in ".!?" else ""
+        if prompts.CALL_VOTE_YES in last:          # vote calls are enabled: say whether we want a vote
+            rounds_seen = last.count("--- Round ")
+            p_yes = min(0.5, 0.15 + 0.07 * rounds_seen)   # ~25% overall, more likely later on
+            roll = rng.random()
+            if roll < 0.03:
+                pass                                      # occasionally forget the line (counts as NO)
+            elif roll < 0.03 + p_yes:
+                text += "\n" + prompts.CALL_VOTE_YES
+            else:
+                text += "\n" + rng.choice([prompts.CALL_VOTE_NO, "call vote: no", "**CALL VOTE:** No."])
+        return text
 
     def _vote(self, rng: random.Random, me: str, last: str) -> str:
         m = re.search(r"^Valid choices: (.+)$", last, re.M)

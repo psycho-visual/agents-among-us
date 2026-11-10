@@ -23,14 +23,16 @@ from imposter_game import prompts  # noqa: E402
 from imposter_game.config import (ConfigError, ModelConfig, RulesConfig, GameConfig,  # noqa: E402
                                   config_from_dict, load_config)
 from imposter_game.game import (Game, build_name_terms, clean_reply, decide_after_vote,  # noqa: E402
-                                find_name_violations, limit_words, parse_vote, redact_names,
-                                resolve_vote, vote_due)
+                                find_name_violations, limit_words, parse_vote, parse_vote_call,
+                                redact_names, resolve_vote, vote_call_triggered, vote_due, vote_trigger)
 from imposter_game.openrouter import MockClient  # noqa: E402
 
 NAMES = ["Red", "Blue", "Green", "Yellow"]
 
 
 def make_cfg(**rules) -> GameConfig:
+    """Test config. Player vote calls are OFF unless a test turns them on."""
+    rules.setdefault("player_vote_calls", False)
     return GameConfig(
         trio=ModelConfig("anthropic/claude-haiku-5.5", "Claude Haiku 5.5", "high"),
         imposter=ModelConfig("openai/gpt-6-luna", "GPT-6 Luna", "max", max_output_tokens=32000),
@@ -172,9 +174,10 @@ class TestTextRules(unittest.TestCase):
 class ScriptedClient:
     """Wraps MockClient; votes are decided by `vote_fn(vote_number, me, is_imposter) -> target text`."""
 
-    def __init__(self, vote_fn=None, seed=0, intro_text=None):
+    def __init__(self, vote_fn=None, seed=0, intro_text=None, call_fn=None):
         self.base = MockClient(seed=seed, delay=0)
         self.vote_fn = vote_fn
+        self.call_fn = call_fn      # call_fn(turn_index (1-based, whole game), me) -> extra last line or None
         self.intro_text = intro_text
         self.lock = threading.Lock()
         self.log: list[tuple[str, str]] = []    # (player, task) in call order
@@ -191,6 +194,11 @@ class ScriptedClient:
             return dataclasses.replace(res, content=f"Some private reasoning.\nVOTE: {target}")
         if prompts.TASK_INTRO in last and self.intro_text:
             return dataclasses.replace(res, content=self.intro_text)
+        if prompts.TASK_ANSWER in last and self.call_fn:
+            turn_index = last.split(prompts.TRANSCRIPT_END)[0].count("\nQuestion ") + 1
+            body = parse_vote_call(res.content)[1]
+            line = self.call_fn(turn_index, me)
+            return dataclasses.replace(res, content=body + (f"\n{line}" if line else ""))
         return res
 
 
@@ -280,13 +288,24 @@ class GameTestBase(unittest.TestCase):
             if r <= g.rounds_completed:
                 self.assertEqual(askers, names)
 
-        # Votes happen only after every rounds_before_vote rounds, after the last answer of that round.
+        # Scheduled votes happen only after every rounds_before_vote rounds, after the last answer of that
+        # round; called votes right after a turn whose vote_call_check triggered.
         rules = g.rules
+        checks = [e for e in events if e["type"] == "vote_call_check"]
+        self.assertEqual(len(checks), g.turns_completed if rules.player_vote_calls else 0)
         for vr in [e for e in events if e["type"] == "vote_result"]:
             rc = vr["rounds_completed"]
-            self.assertTrue(rc % rules.rounds_before_vote == 0 or rc == rules.max_rounds)
             prior_q = [q for q in questions if q["seq"] < vr["seq"]]
-            self.assertEqual(len(prior_q), 4 * rc)
+            self.assertEqual(len(prior_q), vr["turns_completed"])
+            if vr["trigger"] == "scheduled":
+                self.assertTrue(rc % rules.rounds_before_vote == 0 or rc == rules.max_rounds)
+                self.assertEqual(len(prior_q), 4 * rc)
+            else:
+                self.assertTrue(rules.player_vote_calls)
+                last_check = [c for c in checks if c["seq"] < vr["seq"]][-1]
+                self.assertTrue(last_check["triggered"])
+                if vr["trigger"] == "called+scheduled":
+                    self.assertEqual(len(prior_q), 4 * rc)
             casts = [e for e in events if e["type"] == "vote_cast" and e["vote_number"] == vr["vote_number"]]
             self.assertEqual(len(casts), 4)
             for c in casts:
@@ -300,6 +319,10 @@ class GameTestBase(unittest.TestCase):
         go = events[-1]
         self.assertEqual(row["outcome"], go["outcome"])
         self.assertEqual(row["rounds_completed"], go["rounds_completed"])
+        self.assertEqual(row["turns_completed"], go["turns_completed"])
+        self.assertEqual(row["turns_completed"], len(questions) if g.outcome != "error" else row["turns_completed"])
+        self.assertEqual(row["called_votes"] + row["scheduled_votes"]
+                         - sum(1 for v in row["votes"] if v["trigger"] == "called+scheduled"), len(row["votes"]))
         self.assertEqual(row["imposter_seat"], imp)
         self.assertTrue(Path(go["log_file"]).exists())
         self.assertTrue(Path(go["transcript_file"]).exists())
@@ -458,14 +481,15 @@ class TestFullGames(GameTestBase):
                 self.assertIn(prompts.IMPOSTER_LINE, p.system_prompt)
 
     def test_random_mock_games_all_modes(self):
-        for i, (ond, mode, rule) in enumerate([("end", "simultaneous", "lie_allowed"),
-                                               ("end", "sequential", "no_names"),
-                                               ("continue", "simultaneous", "no_names"),
-                                               ("continue", "sequential", "lie_allowed")]):
+        for i, (ond, mode, rule, calls) in enumerate([("end", "simultaneous", "lie_allowed", False),
+                                                      ("end", "sequential", "no_names", True),
+                                                      ("continue", "simultaneous", "no_names", False),
+                                                      ("continue", "sequential", "lie_allowed", True)]):
             for seed in range(3):
-                with self.subTest(ond=ond, mode=mode, seed=seed):
+                with self.subTest(ond=ond, mode=mode, seed=seed, calls=calls):
                     g, events = self.new_game(MockClient(seed=seed * 10 + i, delay=0), seed=seed,
-                                              on_no_decision=ond, answer_mode=mode, name_rule=rule)
+                                              on_no_decision=ond, answer_mode=mode, name_rule=rule,
+                                              player_vote_calls=calls)
                     play(g)
                     self.assertIn(g.outcome, ("trio_win", "imposter_win", "no_decision"))
                     row = self.check_common(g, events)
@@ -479,6 +503,196 @@ class TestFullGames(GameTestBase):
         play(g)
         self.assertTrue((self.log_dir / "summary.jsonl").exists())
         self.assertFalse((self.log_dir / "mock" / "summary.jsonl").exists())
+        self.check_common(g, events)
+
+
+SPLIT = {"Red": "Green", "Blue": "Green", "Green": "Red", "Yellow": "Red"}   # 2-2 split: nobody out
+
+
+class TestVoteCallParsing(unittest.TestCase):
+    def test_variants(self):
+        self.assertEqual(parse_vote_call("My answer.\nCALL VOTE: YES"), (True, "My answer."))
+        self.assertEqual(parse_vote_call("My answer.\ncall vote: no"), (False, "My answer."))
+        self.assertEqual(parse_vote_call("Answer\n**CALL VOTE:** yes."), (True, "Answer"))
+        self.assertEqual(parse_vote_call("Answer\n**CALL VOTE**: No!"), (False, "Answer"))
+        self.assertEqual(parse_vote_call("Answer\nCall Vote:YES"), (True, "Answer"))
+        self.assertEqual(parse_vote_call("Answer\n  `CALL VOTE: no`  "), (False, "Answer"))
+        self.assertEqual(parse_vote_call("Short answer. CALL VOTE: YES"), (True, "Short answer."))
+
+    def test_last_line_wins_and_all_stripped(self):
+        wants, text = parse_vote_call("CALL VOTE: YES\nActually...\nCALL VOTE: NO")
+        self.assertFalse(wants)
+        self.assertEqual(text, "Actually...")
+
+    def test_missing_or_unreadable(self):
+        self.assertEqual(parse_vote_call("Just an answer."), (None, "Just an answer."))
+        self.assertEqual(parse_vote_call("Answer\nCALL VOTE: maybe"), (None, "Answer"))
+        self.assertEqual(parse_vote_call(""), (None, ""))
+        # Ordinary words are left alone.
+        self.assertEqual(parse_vote_call("I would call a vote soon."), (None, "I would call a vote soon."))
+
+    def test_rule_helpers(self):
+        on = RulesConfig(player_vote_calls=True, vote_call_threshold=3)
+        self.assertTrue(vote_call_triggered(["Red", "Blue", "Green"], on))
+        self.assertFalse(vote_call_triggered(["Red", "Blue"], on))
+        self.assertFalse(vote_call_triggered(NAMES, RulesConfig(player_vote_calls=False)))
+        self.assertEqual(vote_trigger(True, True), "called+scheduled")
+        self.assertEqual(vote_trigger(True, False), "called")
+        self.assertEqual(vote_trigger(False, True), "scheduled")
+        self.assertIsNone(vote_trigger(False, False))
+        end = RulesConfig(on_no_decision="end")
+        self.assertEqual(decide_after_vote(None, 0, end, "called"), "continue")
+        self.assertEqual(decide_after_vote(None, 2, end, "called+scheduled"), "no_decision")
+        self.assertEqual(decide_after_vote("imposter", 0, end, "called"), "trio_win")
+        self.assertEqual(decide_after_vote("trio", 1, end, "called"), "imposter_win")
+
+
+class TestVoteCalls(GameTestBase):
+    def calls_game(self, call_fn, vote_fn=lambda n, me, imp: SPLIT[me], **rules):
+        rules.setdefault("player_vote_calls", True)
+        client = ScriptedClient(vote_fn, call_fn=call_fn)
+        return self.new_game(client, **rules)
+
+    def test_three_yes_calls_a_vote_next_step(self):
+        # Red, Blue, Green ask for a vote after the very first question.
+        def call_fn(turn, me):
+            return "CALL VOTE: YES" if turn == 1 and me != "Yellow" else "CALL VOTE: NO"
+
+        g, events = self.calls_game(call_fn, on_no_decision="end")
+        self.assertTrue(g.step()["boundary"])                     # intros
+        self.assertEqual(g.next_label(), "Round 1 · Red asks")
+        self.assertEqual(g.step(), {"boundary": True, "finished": False})   # turn 1 triggers a vote
+        self.assertEqual(g.next_label(), "Vote 1 (called by players)")
+        check = [e for e in events if e["type"] == "vote_call_check"]
+        self.assertEqual(len(check), 1)
+        self.assertEqual((check[0]["requesters"], check[0]["count"], check[0]["threshold"], check[0]["triggered"]),
+                         (["Red", "Blue", "Green"], 3, 3, True))
+        answers = [e for e in events if e["type"] == "message" and e["kind"] == "answer"]
+        self.assertEqual({a["player"]: a["wants_vote"] for a in answers},
+                         {"Red": True, "Blue": True, "Green": True, "Yellow": False})
+        for a in answers:
+            self.assertNotIn("CALL VOTE", a["text"])
+            self.assertIn("CALL VOTE", a["original_text"])
+        self.assertEqual(g.step(), {"boundary": True, "finished": False})   # the called vote: 2-2, continues
+        phase = [e for e in events if e["type"] == "phase" and e["phase"] == "vote"][0]
+        self.assertEqual((phase["trigger"], phase["label"]), ("called", "Vote 1 (called by players)"))
+        vr = [e for e in events if e["type"] == "vote_result"][0]
+        self.assertEqual((vr["trigger"], vr["decision"], vr["rounds_completed"]), ("called", "continue", 0))
+        self.assertEqual(g.next_label(), "Round 1 · Blue asks")    # resumes at the next turn
+        play(g)
+        self.assertEqual(g.outcome, "no_decision")               # the scheduled vote after round 2 ends it
+        vrs = [e for e in events if e["type"] == "vote_result"]
+        self.assertEqual([v["trigger"] for v in vrs], ["called", "scheduled"])
+        self.assertEqual([v["vote_number"] for v in vrs], [1, 2])
+        row = self.check_common(g, events)
+        self.assertEqual((row["called_votes"], row["scheduled_votes"], row["turns_completed"]), (1, 1, 8))
+        # Later prompts announce the called vote; requests stay secret (reveal_vote_calls off).
+        later = [c for c in g.calls if c["purpose"] == "question"][-1]["user_message"]
+        self.assertIn("The players called a vote (3 of 4 requested one).", later)
+        self.assertNotIn("Vote requests:", later)
+        vote_prompt = next(c for c in g.calls if c["purpose"] == "vote")["user_message"]
+        self.assertIn("This vote was called by the players (3 asked for it).", vote_prompt)
+        self.assertIn("the game continues", vote_prompt)
+
+    def test_two_yes_is_not_enough(self):
+        def call_fn(turn, me):
+            return "CALL VOTE: YES" if me in ("Red", "Blue") else "CALL VOTE: NO"
+
+        g, events = self.calls_game(call_fn)
+        play(g)
+        checks = [e for e in events if e["type"] == "vote_call_check"]
+        self.assertEqual(len(checks), 8)
+        self.assertTrue(all(c["count"] == 2 and not c["triggered"] for c in checks))
+        vrs = [e for e in events if e["type"] == "vote_result"]
+        self.assertEqual([v["trigger"] for v in vrs], ["scheduled"])
+        self.check_common(g, events)
+
+    def test_called_and_scheduled_merge(self):
+        # Everyone asks after the last question of round 2, exactly when the scheduled vote is due.
+        def call_fn(turn, me):
+            return "CALL VOTE: YES" if turn == 8 else "CALL VOTE: NO"
+
+        g, events = self.calls_game(call_fn, on_no_decision="end")
+        results = play(g)
+        vrs = [e for e in events if e["type"] == "vote_result"]
+        self.assertEqual(len(vrs), 1)
+        self.assertEqual(vrs[0]["trigger"], "called+scheduled")
+        self.assertEqual(vrs[0]["decision"], "no_decision")      # scheduled rules win
+        self.assertEqual(g.outcome, "no_decision")
+        self.assertEqual(len(results), 10)
+        label = [e for e in events if e["type"] == "phase" and e["phase"] == "vote"][0]["label"]
+        self.assertEqual(label, "Vote 1 (scheduled + called by players)")
+        row = self.check_common(g, events)
+        self.assertEqual((row["called_votes"], row["scheduled_votes"]), (1, 1))
+
+    def test_called_vote_elimination_and_summary(self):
+        holder = {}
+
+        def call_fn(turn, me):
+            if me == "Yellow":
+                return None                                      # forgets the line -> counts as NO
+            return "CALL VOTE: YES" if turn == 3 else "CALL VOTE: NO"
+
+        def vote_fn(n, me, is_imp):
+            return holder["imp"] if me != holder["imp"] else next(x for x in NAMES if x != me)
+
+        g, events = self.calls_game(call_fn, vote_fn, reveal_vote_calls=True)
+        holder["imp"] = g.imposter.name
+        play(g)
+        self.assertEqual(g.outcome, "trio_win")
+        go = events[-1]
+        self.assertEqual((go["rounds_survived"], go["rounds_completed"], go["turns_completed"]), (0, 0, 3))
+        self.assertEqual(go["eliminated_by"], "called")
+        row = self.check_common(g, events)
+        self.assertTrue(row["player_vote_calls"])
+        self.assertEqual(row["vote_call_threshold"], 3)
+        self.assertEqual(row["eliminated_by"], "called")
+        self.assertEqual(row["votes"][0]["trigger"], "called")
+        self.assertEqual(row["votes"][0]["call_count"], 3)
+        req = row["vote_requests_by_model"]
+        total = {k: sum(m[k] for m in req.values()) for k in ("yes", "no", "missing")}
+        self.assertEqual(total, {"yes": 3, "no": 6, "missing": 3})
+        yellow = [e for e in events if e["type"] == "message" and e["player"] == "Yellow" and e["kind"] == "answer"]
+        self.assertTrue(all(e["wants_vote"] is None for e in yellow))
+        note_calls = [c for c in g.calls if c.get("player") == "Yellow" and c["purpose"] == "answer"]
+        self.assertTrue(all(c["vote_call_note"] for c in note_calls))
+        # reveal_vote_calls: requests are public, per turn
+        vote_prompt = next(c for c in g.calls if c["purpose"] == "vote")["user_message"]
+        self.assertIn("Vote requests: none", vote_prompt)
+        self.assertIn("Vote requests: Red, Blue, Green", vote_prompt)
+        self.assertIn("VOTE CALLS", g.players[0].system_prompt)
+        self.assertIn("everyone is shown which players asked for a vote", g.players[0].system_prompt)
+        md = Path(go["transcript_file"]).read_text()
+        self.assertIn("a vote is called", md)
+
+    def test_feature_off_unchanged(self):
+        # Even a client that says YES every time cannot call a vote when the feature is off.
+        g, events = self.calls_game(lambda turn, me: "CALL VOTE: YES", player_vote_calls=False)
+        play(g)
+        self.assertFalse([e for e in events if e["type"] == "vote_call_check"])
+        self.assertEqual([e["trigger"] for e in events if e["type"] == "vote_result"], ["scheduled"])
+        self.assertEqual([e["label"] for e in events if e["type"] == "phase" and e["phase"] == "vote"], ["Vote 1"])
+        for e in events:
+            if e["type"] == "message":
+                self.assertNotIn("wants_vote", e)
+        for p in g.players:
+            self.assertNotIn("CALL VOTE", p.system_prompt)
+            self.assertNotIn("VOTE CALLS", p.system_prompt)
+            self.assertIn("players cannot call votes", p.system_prompt)
+        for c in g.calls:
+            self.assertNotIn("CALL VOTE", (c["user_message"] or "").split(prompts.TRANSCRIPT_END)[-1])
+            self.assertNotIn("scheduled vote", c["user_message"] or "")
+        row = self.check_common(g, events)
+        self.assertFalse(row["player_vote_calls"])
+        self.assertEqual(row["vote_requests_by_model"], {})
+
+    def test_mock_client_emits_vote_calls(self):
+        g, events = self.new_game(MockClient(seed=5, delay=0), player_vote_calls=True)
+        play(g)
+        answers = [e for e in events if e["type"] == "message" and e["kind"] == "answer"]
+        self.assertTrue(answers)
+        self.assertTrue(all("wants_vote" in a for a in answers))
+        self.assertTrue(all("CALL VOTE" not in a["text"].upper() for a in answers))
         self.check_common(g, events)
 
 

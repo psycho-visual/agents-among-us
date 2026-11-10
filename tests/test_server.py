@@ -332,5 +332,77 @@ class ConfigErrorTests(unittest.TestCase):
         self.assertIsNone(c.status()["config_error"])
 
 
+def _engine_supports_vote_calls() -> bool:
+    try:
+        from imposter_game.config import RulesConfig
+        return hasattr(RulesConfig(), "player_vote_calls")
+    except Exception:
+        return False
+
+
+def _config_with_rules(extra: dict) -> str:
+    """config.toml text with some [rules] keys overridden."""
+    lines = CONFIG.read_text(encoding="utf-8").splitlines()
+    out, in_rules = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_rules = stripped == "[rules]"
+            out.append(line)
+            if in_rules:
+                out.extend(f"{k} = {json.dumps(v)}" for k, v in extra.items())
+            continue
+        if in_rules and stripped.split("=")[0].strip() in extra:
+            continue  # drop the original value of an overridden key
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+@unittest.skipUnless(_engine_supports_vote_calls(), "engine has no player_vote_calls yet")
+class VoteCallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="aau-test-votecall-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _play(self, rules: dict, seed: int) -> list[dict]:
+        cfg = self.tmp / f"config-{seed}.toml"
+        cfg.write_text(_config_with_rules(rules), encoding="utf-8")
+        c = GameController(cfg, mock=True, log_dir=self.tmp, mock_options={"delay": 0}, seed=seed)
+        ok, msg = c.new_game()
+        self.assertTrue(ok, msg)
+        q, _ = c.subscribe()
+        self.assertTrue(c.start("all")[0])
+        self.assertTrue(c.wait_idle(120))
+        self.assertEqual(c.status()["state"], "finished")
+        events = []
+        while not q.empty():
+            ev = q.get()
+            if ev and ev.get("type") != "status":
+                events.append(ev)
+        self.assertEqual(events[-1]["type"], "game_over")
+        return events
+
+    def test_called_votes_flow_through_server(self):
+        events = self._play({"player_vote_calls": True, "vote_call_threshold": 1, "on_no_decision": "continue",
+                             "max_rounds": 4}, seed=3)
+        answers = [e for e in events if e["type"] == "message" and e.get("kind") == "answer"]
+        self.assertTrue(answers and all("wants_vote" in e for e in answers))
+        checks = [e for e in events if e["type"] == "vote_call_check"]
+        self.assertTrue(checks)
+        for k in ("round", "turn", "requesters", "count", "threshold", "triggered"):
+            self.assertIn(k, checks[0])
+        vote_phases = [e for e in events if e["type"] == "phase" and e.get("phase") == "vote"]
+        self.assertTrue(all(e.get("trigger") for e in vote_phases))
+        if any(c["triggered"] for c in checks):
+            self.assertTrue(any(str(e.get("trigger", "")).startswith("called") for e in vote_phases))
+        self.assertIn("turns_completed", events[-1])
+
+    def test_feature_off_emits_no_vote_call_events(self):
+        events = self._play({"player_vote_calls": False}, seed=4)
+        self.assertFalse([e for e in events if e["type"] == "vote_call_check"])
+
+
 if __name__ == "__main__":
     unittest.main()

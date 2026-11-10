@@ -69,6 +69,9 @@ class RulesConfig:
     intro_word_limit: int = 80
     question_word_limit: int = 40
     answer_word_limit: int = 100
+    player_vote_calls: bool = True      # players may call a vote (see config.toml)
+    vote_call_threshold: int = 3        # requests needed in one turn to call a vote
+    reveal_vote_calls: bool = False     # show who requested a vote in the public transcript
 
 
 @dataclass
@@ -220,6 +223,9 @@ def _rules_section(table: dict, file: str) -> RulesConfig:
         intro_word_limit=_get(table, "intro_word_limit", d.intro_word_limit, where, int),
         question_word_limit=_get(table, "question_word_limit", d.question_word_limit, where, int),
         answer_word_limit=_get(table, "answer_word_limit", d.answer_word_limit, where, int),
+        player_vote_calls=_get(table, "player_vote_calls", d.player_vote_calls, where, bool),
+        vote_call_threshold=_get(table, "vote_call_threshold", d.vote_call_threshold, where, int),
+        reveal_vote_calls=_get(table, "reveal_vote_calls", d.reveal_vote_calls, where, bool),
     )
     names = [str(n).strip() for n in r.player_names]
     if len(names) != 4 or not all(names):
@@ -235,6 +241,8 @@ def _rules_section(table: dict, file: str) -> RulesConfig:
         raise ConfigError(f"{where} rounds_before_vote must be at least 1 (got {r.rounds_before_vote})")
     if not 1 <= r.vote_threshold <= 4:
         raise ConfigError(f"{where} vote_threshold must be between 1 and 4 (got {r.vote_threshold})")
+    if not 1 <= r.vote_call_threshold <= 4:
+        raise ConfigError(f"{where} vote_call_threshold must be between 1 and 4 (got {r.vote_call_threshold})")
     if r.on_no_decision == "continue" and r.max_rounds < r.rounds_before_vote:
         raise ConfigError(f"{where} max_rounds ({r.max_rounds}) must be at least rounds_before_vote "
                           f"({r.rounds_before_vote})")
